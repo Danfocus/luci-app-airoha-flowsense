@@ -1,105 +1,169 @@
-# **Gemtek-W1700K-6.18 - OpenWrt SnapShot Build Script**
+# luci-app-airoha-flowsense
 
-This is a customized OpenWrt firmware build srript for the **Gemtek W1700K** WiFi 7 (BE19000) router, based on the Airoha AN7581 SoC with MT7996 wireless chipset.
+**Airoha FlowSense** — Hardware Offload & PPE Performance Monitor for the Gemtek W1700K (Airoha AN7581 / MT7996).
 
-> [!WARNING]
-> For those that prefer to build locally (For old farts like me)
+Provides real-time visibility into NPU offload state, PPE flow table health, WiFi band performance, hardware buffer congestion, WAN link integrity, and upstream latency — all from a single LuCI dashboard.
 
-## Build Commands
+---
 
-### Prerequisites (Ubuntu 24.04+)
-```bash
-sudo apt update
-sudo apt install build-essential clang flex bison g++ gawk gcc-multilib \
-g++-multilib gettext git libncurses5-dev libssl-dev python3-distutils rsync \ 
-unzip zlib1g-dev file wget dos2unix`
-```
+## Features
 
-### Clone Repo & Initial Build
+- **NPU / PPE flow monitor** — live counts of bound (BND, hardware-offloaded) and unbound (UNB, learning) flows, with per-band and per-port breakdown
+- **Compass visualisation** — SVG tachometer compass showing NPU path vs. CPU path load, WAN/WiFi integrity, hardware buffer health, and upstream latency
+- **WiFi band tachometers** — per-band (2.4 / 5 / 6 GHz) retry rate, TX throughput, station count, and signal
+  - *Note:* the throughput needle is measured byte-rate (mac80211 per-station counters), so it reads 0 at idle. When traffic is HW-offloaded the byte counters can read 0 under load too — use the frames/sec tachometer and the BND indicator to gauge offloaded activity in that case.
+- **Ethernet port gauges** — per-port TX/RX throughput with link speed and BND/UNB flow counts
+- **Frame engine monitoring** — PSE queue depths, GDM/CDM drop counters via direct hardware register reads
+- **Latency & jitter** — background daemon continuously pings an upstream target (default: 1.1.1.1), independent of routing mode
+- **Auto mode detection** — adapts UI between Router and AP mode automatically
+- **Conflict alerts** — warns when NPU offload is bypassing SQM/CAKE, physical errors are present, or latency is unexpectedly high despite offload being active
+- **Offload toggles** — enable/disable HW flow offload, VLAN offload, and PPPoE offload from the UI, with persistent sysctl settings
 
-```bash
-git clone https://github.com/Gilly1970/Gemtek-W1700K-6.18.git
-```
-```bash
-sudo chmod 775 -R Gemtek-W1700K-6.18
-```
-### Make the script executable and run script
+---
 
-```bash
-# Make script executable
-cd Gemtek-W1700K-6.18
-sudo chmod +x Openwrt_Gemtek_w1700k.sh
-
-# Run script
-./Openwrt_Gemtek_w1700k.sh
+## UI Layout
 
 ```
+[ Conflict Alerts ]          (collapsible — ghost shaper / physical errors / latency anomaly)
 
-### OpenWrt Build Commands (run inside `openwrt/`)
-```bash
-make menuconfig              # Configure packages and kernel options interactively
-make -j$(nproc)              # Build firmware (parallel)
-make -j1 V=s                 # Build with verbose output (for debugging)
-./scripts/feeds update -a    # Update package feed definitions
-./scripts/feeds install -a   # Install feed package symlinks
-make clean                   # Clean build artifacts (keep toolchain)
-make dirclean                # Full clean including toolchain
+[ Main Compass ]             NPU path / integrity / buffer health / latency
+[ CPU/NPU Tachometer ]       CPU load % + frequency + governor
+[ WiFi Tachometers x3 ]      2.4 GHz / 5 GHz / 6 GHz — retry%, throughput, stations, signal
+
+[ Ethernet Port Gauges ]     WAN + LAN1–4: TX/RX bars, link speed, BND/UNB counts
+
+[ Offload Toggles ]          HW Flow Offload / VLAN Offload / PPPoE Offload
+
+[ PPE Terminal ]             Live BND (cyan) + UNB (orange) flow table entries, top 25 each
 ```
 
-### Build Output
-`openwrt/bin/targets/airoha/an7581/` — openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade.itb/images for flashing
+Poll interval: **5 seconds** (all RPC calls made in parallel).
 
-## How the Build Script Works
+---
 
-`Openwrt_Gemtek_w1700k.sh` orchestrates the full setup:
-1. Clones OpenWrt from `https://git.openwrt.org/openwrt/openwrt.git`
-2. Copies files from `openwrt-patches/` to their destinations in the OpenWrt tree, using `openwrt-patches/openwrt-add-patch` as the mapping list (format: `source_filename:destination_path` for conflicts)
-3. Removes files listed in `openwrt-patches/openwrt-remove`
-4. Copies `files/` directory into the OpenWrt `files/` overlay (runtime configs)
-5. Applies `config/config.diff` as the `.config` build configuration
-6. Runs `feeds update/install` then optionally `make menuconfig` before building
+## System Requirements
 
-**To add a new patch**: place the file in `openwrt-patches/` and add its destination path to `openwrt-patches/openwrt-add-patch`.
+### Kernel / Hardware Interfaces
 
-**To add a runtime file** (lands on the router filesystem): place it under `files/etc/...`.
+| Path | Purpose |
+|------|---------|
+| `/sys/kernel/debug/ppe/entries` | Unbound PPE flow entries |
+| `/sys/kernel/debug/ppe/bind` | Bound (hardware-offloaded) PPE flows |
+| `/sys/kernel/debug/ieee80211/phy0/mt76/token_info` | MT7996 WiFi token/queue info |
+| `/sys/kernel/debug/ieee80211/phy0/mt76/tx_stats` | Per-band TX statistics |
+| `/sys/kernel/debug/clk/npu/clk_rate` | NPU clock frequency |
+| `/sys/bus/platform/drivers/airoha-npu/` | NPU driver device enumeration |
+| `/sys/devices/system/cpu/cpufreq/policy0/` | CPU frequency scaling |
+| `/sys/class/net/<iface>/statistics/` | Per-interface TX/RX counters and errors |
+| `/proc/stat` | CPU time counters for load calculation |
+| `/proc/uptime` | System uptime |
+| `/proc/interrupts` | NPU watchdog interrupt counts |
+| `/proc/sys/net/bridge/bridge-nf-filter-vlan-tagged` | VLAN offload toggle |
+| `/proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged` | PPPoE offload toggle |
+| `/lib/firmware/airoha/en7581_MT7996_npu_rv32.bin` | NPU firmware (version parsing) |
 
-## luci-app-airoha-flowsense
+Hardware registers read directly via `devmem`: PSE port queues, GDM/CDM counters, NPU PLL.
 
-**Monitoring dashboard for:** Visual Hardware Offload & PPE Performance Monitor for the Gemtek W1700K (Airoha AN7581 / MT7996).
+---
 
-<img width="780" height="842" alt="image" src="https://github.com/user-attachments/assets/5b8539bb-1aaf-4d30-b7b1-69cffaf22dea" />
+### Required Tools
 
+The RPC backend shell script (`/usr/libexec/rpcd/luci.airoha_flowsense`) requires the following tools to be present on the router:
 
-## Enable and start the flowsense service
+| Tool | Package | Purpose |
+|------|---------|---------|
+| `iw` | `iw` | WiFi interface enumeration and per-station stats |
+| `ip` | `ip-full` | Neighbor table, interface stats, route detection (AP mode) |
+| `bridge` | `bridge-utils` | Bridge FDB and forwarding stats |
+| `tc` | `tc` | Detect CAKE/SQM shaper (conflict alert) |
+| `nft` | `nftables` | Read fw4 flowtable members |
+| `devmem` | `devmem` | Direct hardware register reads (PSE/GDM/CDM/PLL) |
+| `ubus` | *(built-in)* | WAN interface status queries |
+| `uci` | *(built-in)* | Read/write offload and firewall config |
+| `jsonfilter` | `jsonfilter` | JSON extraction from ubus output |
+| `strings` | `binutils` | NPU firmware version parsing |
+| `ping` | *(built-in)* | Jitter daemon upstream latency measurement |
+| `awk` / `sed` / `grep` | *(busybox)* | Text processing throughout |
 
-```bash
-chmod +x /usr/libexec/rpcd/luci.airoha_flowsense
-chmod +x /etc/init.d/npu-jitter
-chmod +x /usr/libexec/npu-jitter-daemon
-/etc/init.d/npu-jitter enable
-/etc/init.d/npu-jitter start
-/etc/init.d/rpcd restart
+---
+
+## Architecture
+
 ```
+Kernel / Hardware
+  debugfs · sysfs · procfs · devmem registers
+        |
+  /usr/libexec/rpcd/luci.airoha_flowsense   (RPC backend shell script)
+  /usr/libexec/npu-jitter-daemon            (background latency daemon)
+        |
+  ubus / rpcd transport
+        |
+  /www/luci-static/resources/view/airoha_flowsense/status.js   (frontend)
+        |
+  Browser (5s poll, parallel RPC calls, SVG/DOM updates)
+```
+
+### RPC Methods
+
+| Method | Type | Description |
+|--------|------|-------------|
+| `getStatus` | read | NPU version, clock, cores, CPU frequency, governor |
+| `getPpeEntries` | read | BND/UNB flow entries, per-band and per-port counts |
+| `getTokenInfo` | read | MT7996 token buffer and queue health per band |
+| `getFrameEngine` | read | PSE queue depths, GDM/CDM drop counters |
+| `getTxStats` | read | Per-band TX attempts, success, drops, PER%, BA miss |
+| `getDeviceMode` | read | Auto-detected Router vs. AP mode |
+| `getWanHealth` | read | WAN interface status, RX/TX bytes/errors |
+| `getJitterResult` | read | Upstream latency, jitter, reachability from daemon |
+| `getWifiStats` | read | Per-band stations, retries, throughput, signal |
+| `getBridgeStats` | read | Bridge RX/TX bytes, drops, forwarding errors |
+| `getNpuBypass` | read | HW offload active, CPU%, WAN Mbps, forwarding path |
+| `getEthStats` | read | Per-port link speed, TX/RX bytes, errors (WAN + LAN1–4) |
+| `getConflictAlerts` | read | Active alert list (ghost shaper, errors, latency) |
+| `getVlanOffload` | read | VLAN offload enabled state |
+| `getFlowOffload` | read | HW flow offload enabled state |
+| `getPppoeOffload` | read | PPPoE offload enabled state |
+| `setVlanOffload` | write | Toggle VLAN offload (persists to `/etc/sysctl.d/`) |
+| `setFlowOffload` | write | Toggle HW flow offload (UCI + firewall reload) |
+| `setPppoeOffload` | write | Toggle PPPoE offload (persists to `/etc/sysctl.d/`) |
+
+---
+
 ## Configuration
 
 `/etc/config/npu-monitor` — UCI config created on install:
 
 ```
-config jitter 'settings'
-    option ping_target '1.1.1.1'
+config jitter 'jitter'
+    option target '1.1.1.1'
 ```
 
-Change `ping_target` to any reachable upstream host for latency monitoring.
+Change the target to any reachable host for latency monitoring:
+
+```
+uci set npu-monitor.jitter.target='192.0.2.1'
+uci commit npu-monitor
+/etc/init.d/npu-jitter restart
+```
+
+If no target is configured, the daemon falls back to the default gateway
+(router mode: the ISP first hop; AP mode: the main router), then `1.1.1.1`.
+
+Note: configs created before 2026-07 used an anonymous section
+(`config jitter` with no name); the init script accepts both, addressing the
+old form as `npu-monitor.@jitter[0].target`.
 
 ---
 
-> [!NOTE]
-> My builds do not have cpu overclocking and are built from master.
-> This is a heavly patched repo and can and will break as new commits are added to master. 
-> I have locked in the last commit that I've compiled and built and can confirm working. 
-> If you want to build from the latest commit just remove the commit hash `readonly OPENWRT_COMMIT=""` and it will use the latest commit.  
- 
-```bash
-OPENWRT_BRANCH="master"
-readonly OPENWRT_COMMIT="a8d5544c8349fe78e99954e948827d1c699ac5da"
-```
+## Package Info
+
+- **Version**: 1.1.5-1
+- **License**: Apache-2.0
+- **Target**: `airoha` only (`@TARGET_airoha`)
+- **LuCI dependency**: `luci-base`
+- **Config file**: `/etc/config/npu-monitor`
+- **Init script**: `/etc/init.d/npu-jitter` (started/restarted on package install)
+
+## Bugs
+
+Report bugs at: https://github.com/Gilly1970/Gemtek-W1700K-6.18/issues
