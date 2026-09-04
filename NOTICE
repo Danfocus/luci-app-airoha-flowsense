@@ -1,0 +1,20 @@
+luci-app-airoha-flowsense
+Copyright 2026 Gilly1970
+
+This product includes software originally developed by
+Gilly1970 (https://github.com/Gilly1970/Gemtek-W1700K-6.18).
+
+Modifications:
+Copyright 2026 Danfocus
+- Adapted for Nokia XG-040G-MD and Nokia XG-040G-MF (non-Wi-Fi Airoha AN7581 XGS-PON ONTs)
+- Port mapping: lan4 configured as WAN, lan1–lan3 as LAN ports in br-lan
+- Stripped eth0 (internal CPU QDMA1 conduit) from user-facing port status
+- Completely removed MT7996 Wi-Fi monitoring (token buffers, TX stats, airtime calibration, wifi_stats)
+- Added real-time SoC/CPU temperature monitoring (/sys/class/thermal/thermal_zone0/temp) to the CPU/NPU gauge
+- Added wired client flow tracking (■ CLIENTS) in PPE terminal using bridge FDB, DHCP leases, and neighbor table
+- Replaced raw devmem register operations with safe read_reg wrapper to prevent shell arithmetic syntax errors
+- Added DTS lookup for NPU firmware name (/proc/device-tree/soc/npu@1e900000/firmware-name)
+- Added caching for NPU reserved memory regions to eliminate repetitive dmesg calls
+- Fixed double-echo arithmetic parsing bug in get_status for npu_cores, offload_bound, and offload_total
+- Improved physical WAN interface error and traffic detection for virtual/PPPoE connections
+- Updated RPCD ACL definitions to grant access to thermal sensor and safe devmem reads

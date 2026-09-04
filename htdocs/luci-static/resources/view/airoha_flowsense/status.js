@@ -9,19 +9,13 @@ var _prevPseDrops    = null;
 var _prevCdmHwfDrops = null;
 var _prevBridgeDrops = null;
 var _prevPpeBnd      = null;  // for tachometer heartbeat
-var _prevBandBnd     = [null, null, null];  // per-WiFi-band BND, drives the HW-accel pulse
-var _maxUnbSeen      = 8;     // UNB scale denominator — only grows, never shrinks
-var _prevWifiRetry   = {};    // keyed by band_idx: {tx_packets, tx_retries}
-var _maxWifiThroughput = 1000; // legacy; superseded by per-band maxMbps in bandInfo
 var _prevEthBytes    = {};    // iface -> {tx, rx, time}
 var _maxEthMbps      = {};    // iface -> peak Mbps seen; grows, never shrinks
 
 /* ── RPC Declarations ── */
 var callNpuStatus        = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getStatus' });
 var callPpeEntries       = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getPpeEntries' });
-var callTokenInfo        = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getTokenInfo' });
 var callFrameEngine      = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getFrameEngine' });
-var callTxStats          = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getTxStats' });
 var callGetVlanOffload   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getVlanOffload' });
 var callSetVlanOffload   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'setVlanOffload', params: ['enabled'] });
 var callGetFlowOffload   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getFlowOffload' });
@@ -33,7 +27,6 @@ var callGetNpuBypass     = rpc.declare({ object: 'luci.airoha_flowsense', method
 var callGetWanHealth     = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getWanHealth' });
 var callGetJitterResult  = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getJitterResult' });
 var callGetConflictAlerts= rpc.declare({ object: 'luci.airoha_flowsense', method: 'getConflictAlerts' });
-var callGetWifiStats     = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getWifiStats' });
 var callGetBridgeStats   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getBridgeStats' });
 var callGetEthStats      = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getEthStats' });
 
@@ -50,7 +43,7 @@ var themeCSS = '\
 .soc-band-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}\
 .soc-gdm-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}\
 .soc-cdm-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:10px}\
-.compass-wrap{display:flex;flex-direction:row;align-items:flex-end;gap:2px;padding:4px 0;flex-wrap:wrap}\
+.compass-wrap{display:flex;flex-direction:row;justify-content:center;align-items:center;gap:24px;padding:8px 0;flex-wrap:wrap}\
 .eth-gauge-wrap{display:flex;flex-direction:row;gap:8px;flex-wrap:wrap;margin-top:8px}\
 .compass-svg-wrap{flex-shrink:0;max-width:326px;width:100%}\
 .compass-cards{display:flex;flex-direction:row;gap:8px;flex-wrap:wrap;margin-top:12px;margin-bottom:4px}\
@@ -123,129 +116,6 @@ function injectCSS() {
  * their own theme-aware --soc-* untouched. Matches the fixed-dark PPE terminal. */
 var GAUGE_VARS = '--soc-card-bg:#16181d;--soc-border:#333;--soc-text:#e0e0e0;--soc-muted:#999;--soc-gauge:#fff;--soc-load:#ffe066';
 
-/* ── Existing Helpers ── */
-var bandInfo = [
-	{ name: '2.4 GHz', accent: 'var(--soc-gauge)', rtyCol: '#EFBF04', gaugeCol: '#EFBF04', maxMbps: 688,   sMax: 700,   sStep: 100,  sDiv: 100,  sCap: '×100 MBPS'  },
-	{ name: '5 GHz',   accent: 'var(--soc-gauge)', rtyCol: '#305CDE', gaugeCol: '#4d7cff', maxMbps: 5765,  sMax: 6000,  sStep: 1000, sDiv: 1000, sCap: '×1000 MBPS' },
-	{ name: '6 GHz',   accent: 'var(--soc-gauge)', rtyCol: '#2CFF05', gaugeCol: '#2CFF05', maxMbps: 11529, sMax: 12000, sStep: 2000, sDiv: 1000, sCap: '×1000 MBPS' }
-];
-
-
-function fmtFreq(khz) { return (!khz || khz === 0) ? 'N/A' : (khz / 1000).toFixed(0) + ' MHz'; }
-function fmtK(n) {
-	if (!n || n === 0) return '0';
-	if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-	if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-	return n.toString();
-}
-
-function calcTotalMem(regions) {
-	var t = 0;
-	(regions || []).forEach(function(r) {
-		var m = (r.size || '').match(/(\d+)\s*(KiB|MiB|GiB)/i);
-		if (m) { var s = parseInt(m[1]); var u = m[2][0].toUpperCase(); t += u === 'G' ? s*1048576 : u === 'M' ? s*1024 : s; }
-	});
-	return t >= 1024 ? (t/1024).toFixed(0)+' MiB' : t+' KiB';
-}
-
-function pleHealth(free) {
-	if (typeof free !== 'number' || free < 0) return { text: 'N/A', color: '#888' };
-	if (free >= 1000000) return { text: 'OK',   color: '#4caf50' };
-	if (free >=  100000) return { text: 'WARN', color: '#ff9800' };
-	return { text: 'CRIT', color: '#f44336' };
-}
-
-function formatPleCount(free) {
-	if (typeof free !== 'number' || free < 0) return '—';
-	if (free >= 1000000) return (free/1000000).toFixed(1) + 'M';
-	if (free >= 1000)    return Math.round(free/1000) + 'K';
-	return free + '';
-}
-
-function getBandStats(ti, b) {
-	var c = Array.isArray(ti.station_counts) ? ti.station_counts : [];
-	for (var i=0;i<c.length;i++) if (c[i].band===b) return c[i];
-	return { band:b, count:0, tx_packets:0, tx_retries:0 };
-}
-
-var _prevBandStats = [null, null, null];
-
-function getBandDelta(current, band) {
-	var prev = _prevBandStats[band];
-	_prevBandStats[band] = { tx_packets: current.tx_packets || 0, tx_retries: current.tx_retries || 0 };
-	if (!prev) return { band: band, count: current.count || 0, tx_packets: 0, tx_retries: 0 };
-	var dp = (current.tx_packets || 0) - prev.tx_packets;
-	var dr = (current.tx_retries || 0) - prev.tx_retries;
-	if (dp < 0) dp = current.tx_packets || 0;
-	if (dr < 0) dr = current.tx_retries || 0;
-	return { band: band, count: current.count || 0, tx_packets: dp, tx_retries: dr };
-}
-
-function getTxQueue(ti, b) {
-	var q = Array.isArray(ti.tx_queues) ? ti.tx_queues : [];
-	for (var i=0;i<q.length;i++) if (q[i].band===b) return q[i];
-	return null;
-}
-
-function bandHealth(s) {
-	if (!s || s.count===0) return { text:'No clients', color:'#888' };
-	if (!s.tx_packets) return { text:'Idle', color:'#888' };
-	var r = (s.retry_pct || 0) / 100;
-	return r>0.5 ? {text:'Poor',color:'#f44336'} : r>0.2 ? {text:'Fair',color:'#ff9800'} : {text:'Good',color:'#4caf50'};
-}
-
-function retryPct(s) {
-	if (!s || !s.tx_packets) return '-';
-	// retry_pct now carries the real per-band Tx PER (per-MPDU hardware metric).
-	return (s.retry_pct || 0) + '%';
-}
-
-function getTxStatsBand(txs, band) {
-	var bands = txs && Array.isArray(txs.bands) ? txs.bands : [];
-	for (var i = 0; i < bands.length; i++) if (bands[i].band === band) return bands[i];
-	return null;
-}
-
-function perColor(per) { return per > 15 ? '#f44336' : per > 5 ? '#ff9800' : '#4caf50'; }
-
-function renderBandChip(band, txQ, stats, txs) {
-	var info = bandInfo[band] || { name: 'Band '+band, accent: '#888' };
-	var id = 'band-'+band;
-	var h = bandHealth(stats);
-	var type = txQ ? txQ.type : '?';
-	var rp = retryPct(stats);
-	var rows = [
-		E('div', { 'style': 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px' }, [
-			E('span', { 'class': 'soc-text', 'style': 'font-size:13px;font-weight:bold' }, info.name),
-			E('span', { 'style': 'background:'+(type==='npu'?'#1565c0':'#666')+';color:#fff;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:600' }, type.toUpperCase())
-		]),
-		E('div', { 'style': 'display:flex;justify-content:space-between;align-items:center;font-size:12px' }, [
-			E('div', { 'id': id+'-health', 'style': 'display:flex;align-items:center;gap:4px' }, [
-				E('span', { 'style': 'width:7px;height:7px;border-radius:50%;background:'+h.color+';display:inline-block' }),
-				E('span', { 'style': 'color:'+h.color+';font-weight:500' }, h.text)
-			]),
-			E('span', { 'id': id+'-clients', 'class': 'soc-muted' }, stats.count + ' sta'),
-			(stats.tx_packets > 0) ? E('span', { 'id': id+'-retries', 'class': 'soc-muted' }, rp) : E('span')
-		])
-	];
-	rows.push(E('div', { 'id': id+'-txstats', 'style': 'display:flex;gap:10px;font-size:11px;margin-top:5px;padding-top:4px;border-top:1px solid var(--soc-border)' },
-		(txs && txs.attempts > 0) ? [
-			E('span', { 'class': 'soc-muted' }, 'Drop:'),
-			E('span', { 'style': 'color:'+(txs.drops > 0 ? '#f44336' : '#4caf50') }, fmtK(txs.drops)),
-			E('span', { 'style': 'color:'+perColor(txs.per) }, txs.per+'%')
-		] : [ E('span', { 'class': 'soc-muted' }, 'Drop: -') ]
-	));
-	return E('div', { 'id': id, 'style': 'background:var(--soc-card-bg);border:1px solid var(--soc-border);border-left:2px solid '+info.accent+';border-radius:6px;padding:10px 12px' }, rows);
-}
-
-function updateBandChip(band, stats) {
-	var id = 'band-'+band, h = bandHealth(stats);
-	var el = document.getElementById(id+'-health');
-	if (el) { el.innerHTML = ''; el.appendChild(E('span',{'style':'width:6px;height:6px;border-radius:50%;background:'+h.color+';display:inline-block'})); el.appendChild(E('span',{'style':'color:'+h.color+';font-weight:500;font-size:11px'},h.text)); }
-	var cl = document.getElementById(id+'-clients'); if (cl) cl.textContent = stats.count+'sta';
-	var re = document.getElementById(id+'-retries'); if (re) re.textContent = retryPct(stats);
-}
-
 /* ── CPU Frequency State (used by CPU/NPU tachometer) ── */
 function freqBarState(hw, min, max, pll, gov) {
 	var pll_khz = (pll || 0) * 1000;
@@ -255,11 +125,6 @@ function freqBarState(hw, min, max, pll, gov) {
 	var oc = gov==='performance' && pll>0 && pll_khz>max;
 	return { freq: oc ? pll_khz : Math.min(hw,max), max: oc ? pll_khz : max, oc: oc };
 }
-
-
-
-
-
 
 function renderVlanOffloadSelect(enabled) {
 	var cur = enabled ? '1' : '0';
@@ -513,24 +378,20 @@ function buildPpeTerminalBody(ppe) {
 	// Prompt + command
 	s += sp(grn,'root@OpenWrt') + sp(mute,':~# ') + sp(wht,'ppe status --watch') + '\n\n';
 
-	// CLIENTS section — per-WiFi-client offload: how many bound (hardware-offloaded)
-	// PPE flows carry each associated station's MAC. Sourced from bnd.client_bnd
-	// (backend matches station MACs from `iw station dump` against eth= in the bind
-	// table); self-filters to WiFi clients. Each direction is its own HW slot.
+	// CLIENTS section — wired LAN devices
 	var clients = (bnd.client_bnd && Array.isArray(bnd.client_bnd)) ? bnd.client_bnd.slice() : [];
-	var bandLbl = ['2.4 GHz', '5 GHz', '6 GHz'];
 	clients.sort(function(a, b) { return (b.bnd || 0) - (a.bnd || 0); });
 	var offCount = 0, maxBnd = 0;
 	clients.forEach(function(c) { if ((c.bnd || 0) > 0) offCount++; if ((c.bnd || 0) > maxBnd) maxBnd = c.bnd || 0; });
 
 	s += sp(cyn, '■ CLIENTS') + '  ' + sp(wht, offCount + ' offloaded') +
-	     '  ' + sp(mute, '(' + clients.length + ' assoc)') + '\n';
+	     '  ' + sp(mute, '(' + clients.length + ' devices)') + '\n';
 	s += sp(sep, divLine) + '\n';
 	if (clients.length === 0) {
-		s += sp(mute, '  no wifi clients') + '\n';
+		s += sp(mute, '  no lan clients detected') + '\n';
 	} else {
-		var CW = { name: 20, mac: 19, band: 9, bnd: 7 };
-		s += sp(mute, pad('Client', CW.name) + '  ' + pad('MAC', CW.mac) + '  ' + pad('Band', CW.band) + '  ' + pad('Bound', CW.bnd) + '  ') + '\n';
+		var CW = { name: 22, mac: 19, port: 8, bnd: 7 };
+		s += sp(mute, pad('Client', CW.name) + '  ' + pad('MAC', CW.mac) + '  ' + pad('Port', CW.port) + '  ' + pad('Bound', CW.bnd) + '  ') + '\n';
 		clients.forEach(function(c) {
 			var n = c.bnd || 0;
 			var barLen = maxBnd > 0 ? Math.round((n / maxBnd) * 20) : 0;
@@ -538,7 +399,7 @@ function buildPpeTerminalBody(ppe) {
 			var nameStr = c.host || c.ip || '—';
 			s += sp(wht, pad(nameStr, CW.name)) + '  ' +
 			     sp(grey, pad(c.mac || '?', CW.mac)) + '  ' +
-			     sp(mute, pad(bandLbl[c.band] || ('band' + c.band), CW.band)) + '  ' +
+			     sp(mute, pad(c.port || 'LAN', CW.port)) + '  ' +
 			     sp(cCol, pad(String(n), CW.bnd)) + '  ' +
 			     sp(cCol, '█'.repeat(barLen)) + '\n';
 		});
@@ -626,9 +487,9 @@ function renderModeBanner(dm) {
 	var reason = dm.reason || '';
 	var reasonMap = { dhcp_disabled: 'DHCP disabled in UCI', no_wan: 'No WAN IP detected', local_gateway: 'Local gateway detected' };
 	var reasonText = reasonMap[reason] || '';
-	return E('div', { 'class': 'mode-banner' }, [
+	return E('div', { 'class': 'mode-banner', 'id': 'mode-banner' }, [
 		E('span', { 'class': 'mode-badge ' + (mode==='ap' ? 'mode-ap' : 'mode-router') },
-			mode === 'ap' ? 'AP MODE' : 'ROUTER MODE'),
+			mode === 'ap' ? 'BRIDGE / AP' : 'ROUTER MODE'),
 		E('span', { 'class': 'soc-muted', 'style': 'font-size:12px' }, 'Auto-detected' + (reasonText ? ' \u2014 '+reasonText : '')),
 		E('span', { 'id': 'mode-banner-status', 'style': 'margin-left:auto;font-size:12px;color:var(--soc-muted)' }, '')
 	]);
@@ -693,9 +554,9 @@ function hwBufferState(fe, ppe, mode) {
 }
 
 /* ── Compass SVG ── */
-function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
+function compassState(bypass, hwBuf, jitter, wan, bridge, mode) {
 	bypass = bypass || {}; hwBuf = hwBuf || {}; jitter = jitter || {};
-	wan = wan || {}; wifi = wifi || {}; bridge = bridge || {};
+	wan = wan || {}; bridge = bridge || {};
 
 	var npuActive = bypass.npu_active  === true;
 	var hwEnabled = bypass.hw_offload_enabled === true;
@@ -706,41 +567,14 @@ function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
 	var latMs = jitter.last_ping || 0;
 
 	// Integrity / errors
-	var errCount = 0;
-	var eastAlarm = false;
-	var worstSignal = 0;  // dBm — 0 means no data; always negative when valid
-	// wbDelta holds per-band signal data; stored in cs so both render paths share it.
-	var wbDelta = [];
-	if (mode === 'router') {
-		errCount = (wan.rx_errors||0) + (wan.tx_errors||0);
-		eastAlarm = errCount > 0;
-	} else {
-		// AP mode: use per-station RSSI from iw station dump (signal avg field).
-		// min_signal = worst (lowest dBm) station on that band — most meaningful
-		// for link integrity since one weak client degrades the whole band's airtime.
-		(wifi.bands||[]).filter(function(b){ return (b.stations||0) > 0; }).forEach(function(b) {
-			var sig = b.min_signal || 0;
-			wbDelta.push({ band: b.band, stations: b.stations, signal: sig, avg_signal: b.avg_signal || 0 });
-			if (sig !== 0 && (worstSignal === 0 || sig < worstSignal)) worstSignal = sig;
-		});
-		// Alarm thresholds: < -75 dBm = weak link, < -82 dBm = poor link
-		eastAlarm = worstSignal !== 0 && worstSignal < -75;
-	}
+	var errCount = (wan.rx_errors||0) + (wan.tx_errors||0);
+	var eastAlarm = errCount > 0;
+	var eastColor = eastAlarm ? '#d0021b' : '#00cc44';
 
-	var eastColor;
-	if (mode === 'router') {
-		eastColor = eastAlarm ? '#d0021b' : '#00cc44';
-	} else {
-		eastColor = worstSignal === 0 ? '#888'
-		          : worstSignal < -82  ? '#d0021b'
-		          : worstSignal < -75  ? '#f5a623'
-		          :                      '#00cc44';
-	}
 	return {
 		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, wanMbps:wanMbps,
 		hwBuf:hwBuf, mode:mode,
 		latMs:latMs, errCount:errCount, eastAlarm:eastAlarm,
-		wbDelta:wbDelta, worstSignal:worstSignal,
 		latColor:latencyColor(latMs),
 		eastColor: eastColor
 	};
@@ -870,7 +704,7 @@ function updateCompassSVG(cs, mode, ppe) {
 }
 
 /* ── CPU/NPU Load Tachometer ── */
-function buildCpuNpuTacho(cs, ppe, st, ti) {
+function buildCpuNpuTacho(cs, ppe, st) {
 	st = st || {};
 	var cpuPct     = cs.cpuPct || 0;
 	var ppeBound   = (ppe.bnd || {}).total || 0;
@@ -883,6 +717,7 @@ function buildCpuNpuTacho(cs, ppe, st, ti) {
 	var fs       = freqBarState(st.cpu_hw_freq, st.cpu_min_freq, st.cpu_max_freq, st.pll_freq_mhz, st.cpu_governor);
 	var freqMhz  = Math.round(fs.freq / 1000);
 	var governor = (st.cpu_governor && st.cpu_governor !== 'unknown') ? st.cpu_governor.toUpperCase() : '';
+	var tempStr  = (st.temperature != null && !isNaN(st.temperature)) ? ' · ' + Number(st.temperature).toFixed(1) + '°C' : '';
 
 	// Load-based colour for the needle + big readout (yellow<50, amber 50-79, red>=80);
 	// fixed CPU-accent green for the scale/name (identity); frequency arc in gauge-blue.
@@ -932,7 +767,7 @@ function buildCpuNpuTacho(cs, ppe, st, ti) {
 		var on = i >= NF - fLit;   // rightmost segments light first (fill right->left)
 		p.push('<path d="M ' + arcPoly(R_F, a1, a2, 3) + '" fill="none" stroke="' + (on ? FREQ_COL : '#1e2a45') + '" stroke-width="5" stroke-linecap="round" opacity="' + (on ? 0.9 : 0.4) + '"/>');
 	}
-	p.push('<text x="150" y="214" text-anchor="middle" font-family="monospace" font-size="7.5" fill="' + FREQ_COL + '" opacity="0.9">' + (freqMhz || '—') + ' MHz</text>');
+	p.push('<text x="150" y="214" text-anchor="middle" font-family="monospace" font-size="7.5" fill="' + FREQ_COL + '" opacity="0.9">' + (freqMhz || '—') + ' MHz' + tempStr + '</text>');
 
 	// NPU/offload inner ring — breathes cyan when the HW offload path is active
 	var hwOn = cs.npuActive;
@@ -956,17 +791,7 @@ function buildCpuNpuTacho(cs, ppe, st, ti) {
 	return p.join('');
 }
 
-function _cnPpeRingStyle(ppe, ti) {
-	// PLE pool health overrides the BND-based cyan default when the WiFi TX buffer pool
-	// drops toward zero — that's the precursor signal for mt7996 SER / TX wedge.
-	var ple = (ti && typeof ti.ple_free === 'number') ? ti.ple_free : -1;
-	if (ple >= 0 && ple < 100000) {
-		return { style: 'filter:blur(6px);opacity:0.85', color: '#f44336' };
-	}
-	if (ple >= 0 && ple < 1000000) {
-		return { style: 'filter:blur(5px);opacity:0.7',  color: '#ff9800' };
-	}
-
+function _cnPpeRingStyle(ppe) {
 	// Default: cyan-on-BND, invisible when no BND
 	var bnd = (ppe && ppe.bnd) ? (ppe.bnd.total || 0) : 0;
 	if (bnd === 0) return { style: 'opacity:0', color: '#00c8ff' };
@@ -976,7 +801,7 @@ function _cnPpeRingStyle(ppe, ti) {
 	return { style: 'filter:blur('+blur+'px);opacity:'+op, color: '#00c8ff' };
 }
 
-function buildCpuNpuCompassSVG(cs, ppe, st, ti) {
+function buildCpuNpuCompassSVG(cs, ppe, st) {
 	// Speedometer sibling of the WiFi band gauges: dark radial face + silver ring, the
 	// tacho draws its own orange/redline rev-band. Defs mirror the WiFi builder (needle
 	// glow, soft number glow, PLE-bar glow).
@@ -988,268 +813,19 @@ function buildCpuNpuCompassSVG(cs, ppe, st, ti) {
 	'<filter id="f-cn-bnd" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
 	'</defs>' +
 	'<circle cx="150" cy="150" r="108" fill="url(#f-cn-face)" stroke="var(--soc-border)" stroke-width="1"/>' +
-	'<g id="cn-tacho">'+buildCpuNpuTacho(cs, ppe, st, ti)+'</g>' +
+	'<g id="cn-tacho">'+buildCpuNpuTacho(cs, ppe, st)+'</g>' +
 	'<circle cx="150" cy="150" r="109" fill="none" stroke="#222222" stroke-width="2.5"/>' +
 	'</svg>';
 }
 
-function updateCpuNpuCompassSVG(cs, ppe, st, ti) {
+function updateCpuNpuCompassSVG(cs, ppe, st) {
 	var tg = document.getElementById('cn-tacho');
-	if (tg) tg.innerHTML = buildCpuNpuTacho(cs, ppe, st, ti);
-}
-
-/* ── WiFi Band Tachometers ── */
-function _wifiBandHealth(ws) {
-	var stations = ws ? (ws.stations || 0) : 0;
-	if (stations === 0) return { text: 'NO CLIENTS', color: '#888' };
-	var rty = ws.retry_pct || 0;
-	if (rty > 50) return { text: 'WEAK', color: '#f44336' };
-	if (rty > 20) return { text: 'FAIR', color: '#ff9800' };
-	return { text: 'GOOD', color: '#4caf50' };
-}
-
-// WiFi band SPEEDOMETER: orange needle on a fixed 0→band-max MBPS scale. Needle = exact tx+rx
-// byte-rate for host-path traffic; for HW-offloaded bands (byte counters bypassed) it falls back
-// to an airtime-derived estimate (air_mbps ≈ airtime×bitrate×0.8) so it tracks offloaded
-// throughput too. Yellow dashed RTY arc inside the numbers
-// fills L→R with retry% (red at the top end); one solid cyan BND bar at the bottom (compass
-// NPU-PATH style) glows when flows are bound; inner cyan HW-ACCELERATED ring breathes when
-// accelerated and fires a one-shot pulse when this band gains a bound flow.
-function buildWifiBandTacho(bandIdx, ws, qType, bndCount, unbCount) {
-	ws = ws || {};
-	var info = bandInfo[bandIdx] || { name: 'Band '+bandIdx, gaugeCol: '#888', sMax: 1000, sStep: 200, sDiv: 1, sCap: 'MBPS' };
-	var col  = info.gaugeCol || '#888';
-	// Throughput needle. Host-path traffic → exact mac80211 tx+rx byte-rate. HW-offloaded
-	// traffic bypasses those counters (needle would read 0), so when the band is offloaded
-	// (BND>0) fall back to the AIRTIME-derived estimate (air_mbps): airtime survives offload
-	// because the MAC spends it on every frame. Use whichever is larger so partial-offload
-	// and pure-host-path both read right. No expected-throughput fallback (that reported link
-	// capability, not throughput, and showed a ghost value at idle on some mt76 builds).
-	var mbps = (ws.tx_mbps || 0) + (ws.rx_mbps || 0);
-	// HW-exact composite: per-band MAC MIB uplink bytes + fw per-station downlink
-	// bytes. Both survive NPU offload and cover MLO links, unlike the mac80211
-	// byte-rate above, so take whichever reads higher — still labelled "MBPS"
-	// because these are real byte counters, not estimates.
-	var hwMbps = (ws.hw_tx_mbps || 0) + (ws.hw_rx_mbps || 0);
-	if (hwMbps > mbps) mbps = hwMbps;
-	var mbpsEst = false;   // true when the reading is the airtime-derived estimate (offloaded)
-	// Airtime estimate only takes over when it clearly exceeds the exact
-	// composite (the one remaining blind spot: an MLD's secondary-link downlink,
-	// which neither byte counter can attribute).
-	if ((bndCount || 0) > 0 && (ws.air_mbps || 0) > mbps * 1.25) { mbps = ws.air_mbps; mbpsEst = true; }
-	var retry = ws.retry_pct || 0;
-	var bnd   = bndCount || 0;
-	var sta   = ws.stations || 0;
-	var sig   = ws.avg_signal || 0;
-	var npu   = qType === 'npu';
-	var max   = info.sMax || 1000;
-
-	// one-shot pulse when this band gains bound flows (compass heartbeat, per-band)
-	var pulsing = (_prevBandBnd[bandIdx] !== null && bnd > _prevBandBnd[bandIdx]);
-	_prevBandBnd[bandIdx] = bnd;
-
-	var CX = 150, CY = 150, TH0 = 150, TH1 = 390, SWEEP = 240;  // v=0 @150 deg (8 o'clock) -> v=max @30 deg (4 o'clock)
-	function pt(r, deg) { var a = deg * Math.PI / 180; return [CX + r * Math.cos(a), CY + r * Math.sin(a)]; }
-	function theta(v) { return TH0 + (Math.max(0, Math.min(max, v)) / max) * SWEEP; }
-	function arcPoly(r, dA, dB, steps) {
-		var s = '', k, d, q;
-		for (k = 0; k <= steps; k++) { d = dA + (dB - dA) * k / steps; q = pt(r, d); s += (k ? 'L' : '') + q[0].toFixed(2) + ' ' + q[1].toFixed(2) + ' '; }
-		return s;
-	}
-	var p = [];
-
-	// outer rev band: orange sweep + red redline at the top end
-	var revSplit = TH0 + SWEEP * 0.85;
-	p.push('<path d="M ' + arcPoly(106, TH0, revSplit, 44) + '" fill="none" stroke="#ff8c1a" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>');
-	p.push('<path d="M ' + arcPoly(106, revSplit, TH1, 10) + '" fill="none" stroke="#ff3b30" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>');
-
-	// main MBPS scale ticks + numbers (band colour = identity)
-	var minor = info.sStep / 5;
-	for (var v = 0; v <= max + 0.5; v += minor) {
-		var major = (Math.round(v) % info.sStep === 0), th = theta(v);
-		var o = pt(104, th), inn = pt(major ? 92 : 98, th);
-		p.push('<line x1="' + o[0].toFixed(1) + '" y1="' + o[1].toFixed(1) + '" x2="' + inn[0].toFixed(1) + '" y2="' + inn[1].toFixed(1) + '" stroke="' + (major ? col : '#5a6472') + '" stroke-width="' + (major ? 2 : 1.1) + '" stroke-linecap="round" opacity="' + (major ? 0.95 : 0.5) + '"/>');
-		if (major) { var lp = pt(82, th); p.push('<text x="' + lp[0].toFixed(1) + '" y="' + (lp[1] + 4).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="' + (v >= max * 0.85 ? '#ff6b60' : '#cfd3d8') + '">' + (v / info.sDiv) + '</text>'); }
-	}
-	p.push('<text x="150" y="128" text-anchor="middle" font-family="monospace" font-size="7.5" letter-spacing="1" fill="var(--soc-muted)">' + info.sCap + '</text>');
-
-	// RTY: chunky dashed arc inside the numbers, same sweep, fills L->R by retry (0-30% = full),
-	// yellow turning red at the top end (redline)
-	var R_RTY = 73, NR = 16, rtyLit = Math.round(Math.min(1, retry / 30) * NR), redFrom = 13;
-	for (var i = 0; i < NR; i++) {
-		var a1 = TH0 + (i / NR) * SWEEP + 1.4, a2 = TH0 + ((i + 1) / NR) * SWEEP - 1.4;
-		var on = i < rtyLit, red = i >= redFrom, rc = on ? (red ? '#ff4d4d' : '#ffcc00') : '#4a4620';
-		p.push('<path d="M ' + arcPoly(R_RTY, a1, a2, 3) + '" fill="none" stroke="' + rc + '" stroke-width="5" stroke-linecap="round" opacity="' + (on ? 0.95 : 0.4) + '"/>');
-	}
-	p.push('<text x="150" y="214" text-anchor="middle" font-family="monospace" font-size="7.5" fill="' + (retry >= 24 ? '#ff4d4d' : '#ffcc00') + '" opacity="0.9">' + retry + '% RTY</text>');
-
-	// HW-ACCELERATED inner ring (breathes when accelerated) + one-shot pulse on new BND
-	var hwOn = npu && bnd > 0;
-	p.push('<circle cx="150" cy="150" r="52" fill="none" stroke="#00c8ff" stroke-width="2" opacity="' + (hwOn ? '0.5' : '0.18') + '"' + (hwOn ? ' style="animation:hw-breathe 2.4s ease-in-out infinite"' : '') + '/>');
-	if (pulsing) p.push('<circle cx="150" cy="150" r="58" fill="none" stroke="#00c8ff" stroke-width="2.5" style="animation:sqm-pulse 1.2s ease-out forwards"/>');
-
-	// BND: one solid glowing bar centred at the bottom (compass NPU-PATH style)
-	var bndOn = bnd > 0, inten = Math.min(1, bnd / 12), bndOp = bndOn ? (0.55 + inten * 0.45).toFixed(2) : '0.16';
-	p.push('<path d="M ' + arcPoly(98, 40, 140, 36) + '" fill="none" stroke="#00c8ff" stroke-width="9" stroke-linecap="round" opacity="' + bndOp + '"' + (bndOn ? ' filter="url(#f-wbnd-' + bandIdx + ')"' : '') + '/>');
-	p.push('<text x="150" y="238" text-anchor="middle" font-family="monospace" font-size="8" font-weight="600" fill="' + (bndOn ? '#00c8ff' : '#556') + '" opacity="0.95">' + bnd + ' BND</text>');
-
-	// band name + HW-accel status
-	p.push('<text x="150" y="118" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" letter-spacing="1" fill="' + col + '">' + info.name.toUpperCase() + '</text>');
-	var hwCol = hwOn ? '#00c8ff' : '#666';
-	p.push('<text x="150" y="140" text-anchor="middle" font-family="monospace" font-size="7" letter-spacing="1" fill="' + hwCol + '">' + (hwOn ? 'HW ACCELERATED' : (npu ? 'NPU IDLE' : 'CPU PATH')) + '</text>');
-
-	// needle + hub
-	var nth = theta(mbps), tip = pt(96, nth), a = nth * Math.PI / 180, dx = Math.cos(a), dy = Math.sin(a), px = -dy, py = dx;
-	var b1 = [CX + px * 5, CY + py * 5], b2 = [CX - px * 5, CY - py * 5], tail = [CX - dx * 20, CY - dy * 20];
-	p.push('<polygon points="' + tip[0].toFixed(1) + ',' + tip[1].toFixed(1) + ' ' + b1[0].toFixed(1) + ',' + b1[1].toFixed(1) + ' ' + tail[0].toFixed(1) + ',' + tail[1].toFixed(1) + ' ' + b2[0].toFixed(1) + ',' + b2[1].toFixed(1) + '" fill="url(#f-wndl-' + bandIdx + ')" filter="url(#f-wglow-' + bandIdx + ')"/>');
-	p.push('<circle cx="150" cy="150" r="12" fill="url(#f-whub-' + bandIdx + ')" stroke="#ff7a2f" stroke-width="1.5"/>');
-	p.push('<circle cx="150" cy="150" r="4" fill="#001417"/>');
-
-	// big MBPS readout (band colour)
-	var lbl = mbps > 0 ? Math.round(mbps) : (sta > 0 ? '0' : '—');
-	p.push('<text x="150" y="176" text-anchor="middle" font-family="monospace" font-size="20" font-weight="700" fill="' + col + '"' + (mbps > 0 ? ' filter="url(#f-wsoft-' + bandIdx + ')"' : '') + '>' + lbl + '</text>');
-	// unit line: "MBPS" for exact byte-rate, "MBPS (est)" when the value is the
-	// airtime-derived offloaded estimate (tighter letter-spacing so it still fits).
-	var unitLbl = (mbpsEst && mbps > 0) ? 'MBPS (est)' : 'MBPS';
-	var unitLs  = (mbpsEst && mbps > 0) ? '1' : '2';
-	p.push('<text x="150" y="187" text-anchor="middle" font-family="monospace" font-size="7" letter-spacing="' + unitLs + '" fill="var(--soc-muted)">' + unitLbl + '</text>');
-	p.push('<text x="150" y="226" text-anchor="middle" font-family="monospace" font-size="7.5" font-weight="600" fill="var(--soc-muted)">' + sta + ' STA' + (sta > 0 && sig ? '  ' + sig + ' dBm' : '') + '</text>');
-
-	return p.join('');
-}
-
-function buildWifiBandSVG(bandIdx, ws, qType, ppe) {
-	var idx      = bandIdx;
-	var bndCount = (ppe && ppe.bnd && Array.isArray(ppe.bnd.band_bnd)) ? (ppe.bnd.band_bnd[bandIdx] || 0) : 0;
-	var unbCount = (ppe && ppe.unb && Array.isArray(ppe.unb.band_unb)) ? (ppe.unb.band_unb[bandIdx] || 0) : 0;
-	return '<svg viewBox="30 30 240 240" xmlns="http://www.w3.org/2000/svg" overflow="hidden" style="width:100%;max-width:207px;display:block;margin:0 auto;'+GAUGE_VARS+'">' +
-	'<defs>' +
-	'<radialGradient id="f-wface-'+idx+'" cx="50%" cy="42%" r="72%"><stop offset="0%" stop-color="#1b2733"/><stop offset="55%" stop-color="#12161c"/><stop offset="100%" stop-color="#0a0c0f"/></radialGradient>' +
-	'<radialGradient id="f-whub-'+idx+'" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#7dffff"/><stop offset="55%" stop-color="#00c8ff"/><stop offset="100%" stop-color="#053947"/></radialGradient>' +
-	'<linearGradient id="f-wndl-'+idx+'" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ffb060"/><stop offset="100%" stop-color="#ff5a1f"/></linearGradient>' +
-	'<filter id="f-wglow-'+idx+'" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-	'<filter id="f-wsoft-'+idx+'" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="1.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-	'<filter id="f-wbnd-'+idx+'" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-	'</defs>' +
-	'<circle cx="150" cy="150" r="108" fill="url(#f-wface-'+idx+')" stroke="var(--soc-border)" stroke-width="1"/>' +
-	'<g id="wifi-tacho-'+idx+'">'+buildWifiBandTacho(bandIdx, ws, qType, bndCount, unbCount)+'</g>' +
-	'<circle cx="150" cy="150" r="109" fill="none" stroke="#222222" stroke-width="2.5"/>' +
-	'</svg>';
-}
-
-function updateWifiBandSVG(bandIdx, ws, qType, ppe) {
-	var tg       = document.getElementById('wifi-tacho-'+bandIdx);
-	var bndCount = (ppe && ppe.bnd && Array.isArray(ppe.bnd.band_bnd)) ? (ppe.bnd.band_bnd[bandIdx] || 0) : 0;
-	var unbCount = (ppe && ppe.unb && Array.isArray(ppe.unb.band_unb)) ? (ppe.unb.band_unb[bandIdx] || 0) : 0;
-	if (tg) tg.innerHTML = buildWifiBandTacho(bandIdx, ws, qType, bndCount, unbCount);
-	// MLO frames banana (only present in the DOM when MLO built it)
-	var bw = document.getElementById('wifi-banana-wrap-'+bandIdx);
-	if (bw) bw.innerHTML = buildWifiFramesBanana(bandIdx, ws);
-}
-
-// Flows/sec tachometer: an automotive sweep-needle gauge in the same slot above each WiFi band
-// gauge (replaces the old crescent "banana"). Per-band frame rate (rx_fragments uplink +
-// Tx-success downlink — survives NPU offload) drives the needle on a FIXED 0–15 (×1000 F/S)
-// scale so the reading is meaningful across pods: majors 0/3/6/9/12/15, minors every 500,
-// redline from 12k. Swept arc + lit ticks in band colour; classic red needle; the bottom edge
-// arches up to cradle the round gauge below; digital f/s readout kept as our own touch.
-function buildWifiFramesBanana(bandIdx, ws) {
-	ws = ws || {};
-	var info = bandInfo[bandIdx] || { rtyCol: '#888' };
-	var col  = info.gaugeCol || info.rtyCol;      // band identity colour (amber/blue/green)
-	var fps  = ws.frames_ps || 0;
-	var id   = bandIdx;
-
-	var HX = 120, HY = 100, R_TICK = 90, R_LABEL = 66, R_VALARC = 86, R_FACE = 96;
-	var TH0 = 202, TH1 = -22, SWEEP = TH0 - TH1;   // v=0 -> 202°, v=max -> -22° (clockwise over the top)
-	var MAX_FPS = 15000, REDLINE = 12000;
-	function pt(r, deg) { var a = deg * Math.PI / 180; return [HX + r * Math.cos(a), HY - r * Math.sin(a)]; }
-	function theta(f) { var v = Math.max(0, Math.min(MAX_FPS, f)); return TH0 - (v / MAX_FPS) * SWEEP; }
-	// sampled arc polyline (avoids SVG arc-flag guesswork), returns "x y L x y ..."
-	function arcPoly(r, dA, dB, steps) {
-		var s = '', i, d, q;
-		for (i = 0; i <= steps; i++) { d = dA + (dB - dA) * i / steps; q = pt(r, d); s += (i ? 'L' : '') + q[0].toFixed(2) + ' ' + q[1].toFixed(2) + ' '; }
-		return s;
-	}
-
-	var p = [];
-	p.push('<defs>' +
-		'<radialGradient id="f-face-' + id + '" cx="50%" cy="38%" r="75%"><stop offset="0%" stop-color="#20242b"/><stop offset="70%" stop-color="#14161b"/><stop offset="100%" stop-color="#0c0d10"/></radialGradient>' +
-		'<filter id="f-fps-glow-' + id + '" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-		'<filter id="f-fps-ndl-' + id + '" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-		'<linearGradient id="f-needle-' + id + '" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ff8a3d"/><stop offset="100%" stop-color="#ff2d20"/></linearGradient>' +
-	'</defs>');
-	// face: domed top (outer arc) + bottom edge arched UP in the middle to cradle the round gauge
-	var pFaceL = pt(R_FACE, 203);
-	var faceD = 'M ' + arcPoly(R_FACE, 203, -23, 48) + 'Q 120 108 ' + pFaceL[0].toFixed(2) + ' ' + pFaceL[1].toFixed(2) + ' Z';
-	// #222222 silver bezel under the face, matching the round WiFi speedo's outer ring
-	p.push('<path d="' + faceD + '" fill="none" stroke="#222222" stroke-width="2.5" stroke-linejoin="round"/>');
-	p.push('<path d="' + faceD + '" fill="url(#f-face-' + id + ')" stroke="var(--soc-border)" stroke-width="1" stroke-linejoin="round"/>');
-	// outer orange→red rev band just outside the ticks, matching the round WiFi speedo's outer ring
-	// (splits at the redline point so orange runs 0→12k, red 12k→15k)
-	var revA = theta(REDLINE);
-	p.push('<path d="M ' + arcPoly(93, TH0, revA, 40) + '" fill="none" stroke="#ff8c1a" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>');
-	p.push('<path d="M ' + arcPoly(93, revA, TH1, 12) + '" fill="none" stroke="#ff3b30" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>');
-	// dim full track, faint redline zone, lit value arc (band colour, red past redline)
-	p.push('<path d="M ' + arcPoly(R_VALARC, TH0, TH1, 60) + '" fill="none" stroke="#31363f" stroke-width="4" stroke-linecap="round"/>');
-	p.push('<path d="M ' + arcPoly(R_VALARC, theta(REDLINE), TH1, 20) + '" fill="none" stroke="#ff3b30" stroke-width="4" stroke-linecap="round" opacity="0.30"/>');
-	if (fps > 0) {
-		var litArc = (fps >= REDLINE) ? '#ff3b30' : col;
-		p.push('<path d="M ' + arcPoly(R_VALARC, TH0, theta(fps), 60) + '" fill="none" stroke="' + litArc + '" stroke-width="4.5" stroke-linecap="round" filter="url(#f-fps-glow-' + id + ')"/>');
-	}
-	// ticks: minors every 500, majors every 3000; lit up to current f/s
-	for (var v = 0; v <= MAX_FPS; v += 500) {
-		var major = (v % 3000 === 0), th = theta(v), red = (v >= REDLINE);
-		var len = major ? 15 : 8, o = pt(R_TICK, th), inn = pt(R_TICK - len, th);
-		var lit = v <= fps, tc = lit ? (red ? '#ff3b30' : col) : '#3a3f47';
-		p.push('<line x1="' + o[0].toFixed(2) + '" y1="' + o[1].toFixed(2) + '" x2="' + inn[0].toFixed(2) + '" y2="' + inn[1].toFixed(2) + '" stroke="' + tc + '" stroke-width="' + (major ? 2.4 : 1.4) + '" stroke-linecap="round" opacity="' + (lit ? 1 : 0.55) + '"/>');
-	}
-	// numbers (×1000) at the majors
-	[0, 3, 6, 9, 12, 15].forEach(function(k) {
-		var lp = pt(R_LABEL, theta(k * 1000));
-		p.push('<text x="' + lp[0].toFixed(1) + '" y="' + (lp[1] + 4).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="' + (k >= 12 ? '#ff6b60' : '#cfd3d8') + '">' + k + '</text>');
-	});
-	// caption + digital readout (our own touch — exact f/s)
-	p.push('<text x="120" y="70" text-anchor="middle" font-family="monospace" font-size="8.5" letter-spacing="1.5" fill="var(--soc-muted)">×1000 F/S</text>');
-	p.push('<text x="120" y="90" text-anchor="middle" font-family="monospace" font-weight="700" font-size="15" fill="' + (fps > 0 ? (fps >= REDLINE ? '#ff3b30' : col) : 'var(--soc-muted)') + '">' + (fps > 0 ? fmtK(fps) : '—') + '</text>');
-	// needle
-	var nth = theta(fps), tip = pt(82, nth), a = nth * Math.PI / 180;
-	var dx = Math.cos(a), dy = -Math.sin(a), px = -dy, py = dx;
-	var b1 = [HX + px * 4.5, HY + py * 4.5], b2 = [HX - px * 4.5, HY - py * 4.5], tail = [HX - dx * 16, HY - dy * 16];
-	p.push('<polygon points="' + tip[0].toFixed(1) + ',' + tip[1].toFixed(1) + ' ' + b1[0].toFixed(1) + ',' + b1[1].toFixed(1) + ' ' + tail[0].toFixed(1) + ',' + tail[1].toFixed(1) + ' ' + b2[0].toFixed(1) + ',' + b2[1].toFixed(1) + '" fill="url(#f-needle-' + id + ')" filter="url(#f-fps-ndl-' + id + ')"/>');
-	p.push('<circle cx="120" cy="100" r="9" fill="#1a1d22" stroke="#4a5058" stroke-width="1.5"/>');
-	p.push('<circle cx="120" cy="100" r="3.4" fill="#2a2f37"/>');
-
-	return '<svg viewBox="0 0 240 140" xmlns="http://www.w3.org/2000/svg" overflow="visible" style="width:100%;max-width:176px;display:block;margin:0 auto -16px;' + GAUGE_VARS + '">' +
-		p.join('') + '</svg>';
-}
-
-// Returns array of 3 elements (6 GHz, 5 GHz, 2.4 GHz) for direct inclusion in compass-wrap
-function buildWifiTachoElements(wifi, ti, st, ppe) {
-	var bands = (wifi && Array.isArray(wifi.bands)) ? wifi.bands : [];
-	var isMlo = !!(wifi && wifi.mlo);
-	var fallbackType = (st && st.npu_loaded) ? 'npu' : 'dma';
-	var elems = [];
-	// 6 GHz → 5 GHz → 2.4 GHz (band index 2 → 1 → 0)
-	for (var b = 2; b >= 0; b--) {
-		var ws = null;
-		for (var j = 0; j < bands.length; j++) if (bands[j].band === b) { ws = bands[j]; break; }
-		var txQ = getTxQueue(ti, b) || { type: fallbackType };
-		var svgWrap = E('div', { 'id': 'wifi-svg-wrap-'+b });
-		// Frames banana above each gauge (per-band f/s). Shown for BOTH MLO and
-		// standard: per-band frames_ps is available in both now (standard reads
-		// per-netdev rx_fragments, MLO sums per-link). buildWifiFramesBanana is
-		// null-safe, so the empty 2.4 GHz band just renders a "—" pod.
-		var banana = '<div id="wifi-banana-wrap-'+b+'">'+buildWifiFramesBanana(b, ws)+'</div>';
-		svgWrap.innerHTML = banana + buildWifiBandSVG(b, ws, txQ.type, ppe);
-		elems.push(svgWrap);
-	}
-	return elems;
+	if (tg) tg.innerHTML = buildCpuNpuTacho(cs, ppe, st);
 }
 
 /* ── Ethernet Port Horizontal Bar Gauges ── */
 function _ethLabel(iface) {
-	var m = { wan:'WAN', lan1:'LAN 1', lan2:'LAN 2', lan3:'LAN 3', lan4:'LAN 4' };
+	var m = { lan4:'WAN (LAN 4)', lan1:'LAN 1', lan2:'LAN 2', lan3:'LAN 3', wan:'WAN' };
 	return m[iface] || iface.toUpperCase();
 }
 function _ethSpeed(speed) {
@@ -1269,7 +845,7 @@ function _ethFmt(mbps) {
 
 function buildEthPortSVG(port, txMbps, rxMbps, ppe) {
 	var iface    = port.iface || '';
-	var isWan    = (iface === 'wan');
+	var isWan    = (iface === 'lan4' || iface === 'wan');
 	var up       = !!port.up;
 	var maxSc    = _maxEthMbps[iface] || 100;
 	var barW     = 140;
@@ -1283,18 +859,12 @@ function buildEthPortSVG(port, txMbps, rxMbps, ppe) {
 	var spLbl    = _ethSpeed(up ? (port.speed || 0) : 0);
 	var portClr  = up ? (isWan ? '#00ffff' : '#00ff00') : '#555';
 	var dimOp    = up ? '1' : '0.4';
-	// Footer: WAN shows wired BND (total minus per-band WiFi BND); LAN ports show per-port BND from bridge FDB match
+	// Footer: WAN shows wired BND; LAN ports show per-port BND from bridge FDB match
 	var footerTxt, footerClr;
 	if (isWan) {
 		if (up) {
-			var bndTotal  = (ppe && ppe.bnd) ? (ppe.bnd.total || 0) : 0;
-			var bandBnd   = (ppe && ppe.bnd && ppe.bnd.band_bnd) ? ppe.bnd.band_bnd : [0,0,0];
-			var wifiBnd   = (bandBnd[0]||0) + (bandBnd[1]||0) + (bandBnd[2]||0);
-			var wiredBnd  = Math.max(0, bndTotal - wifiBnd);
-			var unbTotal  = (ppe && ppe.unb) ? (ppe.unb.total || 0) : 0;
-			var bandUnb   = (ppe && ppe.unb && ppe.unb.band_unb) ? ppe.unb.band_unb : [0,0,0];
-			var wifiUnb   = (bandUnb[0]||0) + (bandUnb[1]||0) + (bandUnb[2]||0);
-			var wiredUnb  = Math.max(0, unbTotal - wifiUnb);
+			var wiredBnd  = (ppe && ppe.bnd) ? (ppe.bnd.total || 0) : 0;
+			var wiredUnb  = (ppe && ppe.unb) ? (ppe.unb.total || 0) : 0;
 			footerTxt = 'BND: ' + wiredBnd + '  UNB: ' + wiredUnb;
 			footerClr = '#00c8ff';
 		} else {
@@ -1302,8 +872,8 @@ function buildEthPortSVG(port, txMbps, rxMbps, ppe) {
 			footerClr = '#555';
 		}
 	} else {
-		var portIdx  = {lan1:0, lan2:1, lan3:2, lan4:3}[iface];
-		var bndPort  = (ppe && ppe.bnd && ppe.bnd.port_bnd) ? (ppe.bnd.port_bnd[portIdx] || 0) : 0;
+		var portIdx  = {lan1:0, lan2:1, lan3:2}[iface];
+		var bndPort  = (ppe && ppe.bnd && ppe.bnd.port_bnd && typeof portIdx === 'number') ? (ppe.bnd.port_bnd[portIdx] || 0) : 0;
 		footerTxt = 'BND: ' + bndPort;
 		footerClr = bndPort > 0 ? '#00c8ff' : '#555';
 	}
@@ -1344,8 +914,8 @@ function buildEthGaugeRow(ethPorts, ppe) {
 }
 
 /* ── Compass Data Cards ── */
-function renderCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
-	bypass=bypass||{}; jitter=jitter||{}; wan=wan||{}; wifi=wifi||{};
+function renderCompassCards(cs, bypass, jitter, wan, bridge, mode) {
+	bypass=bypass||{}; jitter=jitter||{}; wan=wan||{};
 
 	// North card: NPU Path
 	bridge = bridge || {};
@@ -1359,22 +929,8 @@ function renderCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
 		: 'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps';
 
 	// East card: Integrity
-	var eastVal, eastSub;
-	if (mode === 'router') {
-		eastVal = cs.eastAlarm ? cs.errCount+' ERROR'+(cs.errCount>1?'S':'') : 'CLEAN';
-		eastSub = 'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0);
-	} else {
-		var ws = cs.worstSignal;
-		eastVal = cs.wbDelta.length === 0 ? 'NO CLIENTS'
-		        : ws === 0               ? 'NO DATA'
-		        : ws < -82               ? 'POOR'
-		        : ws < -75               ? 'WEAK'
-		        :                          'CLEAN';
-		var bnames = ['2.4G','5G','6G'];
-		eastSub = cs.wbDelta.length > 0
-			? 'Signal: '+cs.wbDelta.map(function(b){ return (bnames[b.band]||('B'+b.band))+': '+b.signal+' dBm'; }).join('  |  ')
-			: 'No connected clients';
-	}
+	var eastVal = cs.eastAlarm ? cs.errCount+' ERROR'+(cs.errCount>1?'S':'') : 'CLEAN';
+	var eastSub = 'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0);
 	var eastColor = cs.eastColor;
 
 	// South card: HW Buffer Health
@@ -1404,13 +960,13 @@ function renderCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
 	]);
 }
 
-function updateCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
+function updateCompassCards(cs, bypass, jitter, wan, bridge, mode) {
 	var cards = document.getElementById('compass-cards');
 	if (!cards) return;
 	var divs = cards.querySelectorAll('.compass-card');
 	if (divs.length < 4) return;
 
-	bypass=bypass||{}; jitter=jitter||{}; wan=wan||{}; wifi=wifi||{}; bridge=bridge||{};
+	bypass=bypass||{}; jitter=jitter||{}; wan=wan||{}; bridge=bridge||{};
 
 	function setCard(div, val, color, sub) {
 		var v = div.querySelector('.compass-card-value');
@@ -1429,24 +985,9 @@ function updateCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
 			?'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta2
 			:'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps');
 
-	if (mode === 'router') {
-		setCard(divs[1], cs.eastAlarm?cs.errCount+' ERROR'+(cs.errCount>1?'S':''):'CLEAN',
-			cs.eastColor,
-			'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0));
-	} else {
-		var ws2 = cs.worstSignal;
-		var bnames2 = ['2.4G','5G','6G'];
-		setCard(divs[1],
-			cs.wbDelta.length === 0 ? 'NO CLIENTS'
-			: ws2 === 0             ? 'NO DATA'
-			: ws2 < -82             ? 'POOR'
-			: ws2 < -75             ? 'WEAK'
-			:                         'CLEAN',
-			cs.eastColor,
-			cs.wbDelta.length > 0
-				? 'Signal: '+cs.wbDelta.map(function(b){ return (bnames2[b.band]||('B'+b.band))+': '+b.signal+' dBm'; }).join('  |  ')
-				: 'No connected clients');
-	}
+	setCard(divs[1], cs.eastAlarm?cs.errCount+' ERROR'+(cs.errCount>1?'S':''):'CLEAN',
+		cs.eastColor,
+		'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0));
 
 	var latVal = cs.latMs > 0 ? cs.latMs.toFixed(1)+'ms' : (jitter.available===false?'N/A':'---');
 	setCard(divs[2], latVal, cs.latColor,
@@ -1465,44 +1006,39 @@ return view.extend({
 		return Promise.all([
 			callNpuStatus(),        // d[0]
 			callPpeEntries(),       // d[1]
-			callTokenInfo(),        // d[2]
-			callFrameEngine(),      // d[3]
-			callGetVlanOffload(),   // d[4]
-			callTxStats(),          // d[5]
-			callGetDeviceMode(),    // d[6]
-			callGetNpuBypass(),     // d[7]
-			callGetWanHealth(),     // d[8]
-			callGetJitterResult(),  // d[9]
-			callGetConflictAlerts(),// d[10]
-			callGetWifiStats(),     // d[11]
-			callGetBridgeStats(),   // d[12]
-			callGetFlowOffload(),   // d[13]
-			callGetPppoeOffload(),  // d[14]
-			callGetEthStats()       // d[15]
+			callFrameEngine(),      // d[2]
+			callGetVlanOffload(),   // d[3]
+			callGetDeviceMode(),    // d[4]
+			callGetNpuBypass(),     // d[5]
+			callGetWanHealth(),     // d[6]
+			callGetJitterResult(),  // d[7]
+			callGetConflictAlerts(),// d[8]
+			callGetBridgeStats(),   // d[9]
+			callGetFlowOffload(),   // d[10]
+			callGetPppoeOffload(),  // d[11]
+			callGetEthStats()       // d[12]
 		]);
 	},
 
 	render: function(data) {
 		injectCSS();
-		var st=data[0]||{}, ppe=data[1]||{}, ti=data[2]||{}, fe=data[3]||{};
-		var vo=data[4]||{}, txs=data[5]||{}, dm=data[6]||{};
-		var bypass=data[7]||{}, wan=data[8]||{};
-		var jitter=data[9]||{}, alertData=data[10]||{};
-		var wifi=data[11]||{}, bridge=data[12]||{};
-		var flo=data[13]||{}, ppo=data[14]||{};
-		var eth=data[15]||{};
-		var memR = Array.isArray(st.memory_regions) ? st.memory_regions : [];
+		var st=data[0]||{}, ppe=data[1]||{}, fe=data[2]||{};
+		var vo=data[3]||{}, dm=data[4]||{};
+		var bypass=data[5]||{}, wan=data[6]||{};
+		var jitter=data[7]||{}, alertData=data[8]||{};
+		var bridge=data[9]||{}, flo=data[10]||{};
+		var ppo=data[11]||{}, eth=data[12]||{};
 		var mode = dm.mode || 'router';
 
 		var hwBuf = hwBufferState(fe, ppe, mode);
-		var cs = compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode);
+		var cs = compassState(bypass, hwBuf, jitter, wan, bridge, mode);
 
 		// Compass SVG container — tachometer is embedded inside (innerHTML so we can update by element ID)
 		var compassSvgWrap = E('div', { 'class': 'compass-svg-wrap', 'id': 'compass-svg-wrap' });
 		compassSvgWrap.innerHTML = buildCompassSVG(cs, mode, ppe);
 
 		var cnWrap = E('div', { 'id': 'cpu-npu-svg-wrap', 'style': 'flex-shrink:0' });
-		cnWrap.innerHTML = buildCpuNpuCompassSVG(cs, ppe, st, ti);
+		cnWrap.innerHTML = buildCpuNpuCompassSVG(cs, ppe, st);
 
 		var view = E('div',{'class':'cbi-map'},[
 			E('h2',{},_('Airoha FlowSense')),
@@ -1512,12 +1048,12 @@ return view.extend({
 
 			// Offload Monitor
 			E('div',{'class':'cbi-section'},[
-				// Gauges: CPU/NPU tachometer, compass, WiFi tachometers, compass cards, mode banner
+				// Gauges: CPU/NPU tachometer, compass, compass cards, mode banner
 				E('div', { 'class': 'compass-wrap' }, [
 					cnWrap,
 					compassSvgWrap
-				].concat(buildWifiTachoElements(wifi, ti, st, ppe))),
-				renderCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode),
+				]),
+				renderCompassCards(cs, bypass, jitter, wan, bridge, mode),
 				// Ethernet port gauges row
 				buildEthGaugeRow((eth && Array.isArray(eth.ports)) ? eth.ports : [], ppe),
 				renderModeBanner(dm),
@@ -1541,47 +1077,43 @@ return view.extend({
 
 		poll.add(L.bind(function() {
 			return Promise.all([
-				callNpuStatus(), callPpeEntries(), callTokenInfo(), callFrameEngine(),
-				callGetVlanOffload(), callTxStats(),
+				callNpuStatus(), callPpeEntries(), callFrameEngine(),
+				callGetVlanOffload(),
 				callGetDeviceMode(), callGetNpuBypass(),
 				callGetWanHealth(), callGetJitterResult(), callGetConflictAlerts(),
-				callGetWifiStats(), callGetBridgeStats(),
-				callGetFlowOffload(), callGetPppoeOffload(),
-				callGetEthStats()
+				callGetBridgeStats(), callGetFlowOffload(),
+				callGetPppoeOffload(), callGetEthStats()
 			]).then(L.bind(function(d) {
 				injectCSS();
-				var st=d[0]||{}, ppe=d[1]||{}, ti=d[2]||{}, fe=d[3]||{};
-				var vo=d[4]||{}, txs=d[5]||{}, dm=d[6]||{};
-				var bypass=d[7]||{}, wan=d[8]||{};
-				var jitter=d[9]||{}, alertData=d[10]||{};
-				var wifi=d[11]||{}, bridge=d[12]||{};
-				var flo=d[13]||{}, ppo=d[14]||{};
-				var eth=d[15]||{};
+				var st=d[0]||{}, ppe=d[1]||{}, fe=d[2]||{};
+				var vo=d[3]||{}, dm=d[4]||{};
+				var bypass=d[5]||{}, wan=d[6]||{};
+				var jitter=d[7]||{}, alertData=d[8]||{};
+				var bridge=d[9]||{}, flo=d[10]||{};
+				var ppo=d[11]||{}, eth=d[12]||{};
 				var mode = dm.mode || 'router';
 
 				// Compass update (tachometer embedded inside compass)
 				var hwBuf = hwBufferState(fe, ppe, mode);
-				var cs = compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode);
+				var cs = compassState(bypass, hwBuf, jitter, wan, bridge, mode);
 				updateCompassSVG(cs, mode, ppe);
-				updateCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode);
+				updateCompassCards(cs, bypass, jitter, wan, bridge, mode);
 
 				// CPU/NPU Load compass update
-				updateCpuNpuCompassSVG(cs, ppe, st, ti);
-
-				// WiFi band tachometers
-				var wbands = (wifi && Array.isArray(wifi.bands)) ? wifi.bands : [];
-				var wFallback = st.npu_loaded ? 'npu' : 'dma';
-				for (var wb = 0; wb < 3; wb++) {
-					var wws = null;
-					for (var wj = 0; wj < wbands.length; wj++) if (wbands[wj].band === wb) { wws = wbands[wj]; break; }
-					updateWifiBandSVG(wb, wws, (getTxQueue(ti, wb) || { type: wFallback }).type, ppe);
-				}
+				updateCpuNpuCompassSVG(cs, ppe, st);
 
 				// Conflict alerts
 				var alertWrap = document.getElementById('conflict-alerts');
 				if (alertWrap) {
 					var fresh = renderConflictAlerts(alertData);
 					alertWrap.innerHTML = fresh.innerHTML;
+				}
+
+				// Mode banner update
+				var mb = document.getElementById('mode-banner');
+				if (mb) {
+					var freshMb = renderModeBanner(dm);
+					mb.innerHTML = freshMb.innerHTML;
 				}
 
 				// Offload selects + badges
