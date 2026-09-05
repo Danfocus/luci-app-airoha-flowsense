@@ -11,7 +11,7 @@ Copyright 2026 Danfocus
 - Stripped eth0 (internal CPU QDMA1 conduit) from user-facing port status
 - Completely removed MT7996 Wi-Fi monitoring (token buffers, TX stats, airtime calibration, wifi_stats)
 - Added real-time SoC/CPU temperature monitoring (/sys/class/thermal/thermal_zone0/temp) to the CPU/NPU gauge
-- Added wired client flow tracking (■ CLIENTS) in PPE terminal using bridge FDB, DHCP leases, and neighbor table
+- Added wired client flow tracking (■ CLIENTS) in PPE terminal strictly tied to physical ports LAN 1–3 via bridge FDB (preventing WAN gateway and upstream devices on lan4 from appearing as clients), with IP/hostname resolution from DHCP leases and ARP neighbors
 - Replaced raw devmem register operations with safe read_reg wrapper to prevent shell arithmetic syntax errors
 - Added DTS lookup for NPU firmware name (/proc/device-tree/soc/npu@1e900000/firmware-name)
 - Added caching for NPU reserved memory regions to eliminate repetitive dmesg calls

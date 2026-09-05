@@ -390,14 +390,14 @@ function buildPpeTerminalBody(ppe) {
 	if (clients.length === 0) {
 		s += sp(mute, '  no lan clients detected') + '\n';
 	} else {
-		var CW = { name: 22, mac: 19, port: 8, bnd: 7 };
-		s += sp(mute, pad('Client', CW.name) + '  ' + pad('MAC', CW.mac) + '  ' + pad('Port', CW.port) + '  ' + pad('Bound', CW.bnd) + '  ') + '\n';
+		var CW = { host: 20, ip: 16, mac: 19, port: 8, bnd: 7 };
+		s += sp(mute, pad('Host', CW.host) + '  ' + pad('IP', CW.ip) + '  ' + pad('MAC', CW.mac) + '  ' + pad('Port', CW.port) + '  ' + pad('Bound', CW.bnd) + '  ') + '\n';
 		clients.forEach(function(c) {
 			var n = c.bnd || 0;
 			var barLen = maxBnd > 0 ? Math.round((n / maxBnd) * 20) : 0;
 			var cCol = n > 0 ? cyn : dim;
-			var nameStr = c.host || c.ip || '—';
-			s += sp(wht, pad(nameStr, CW.name)) + '  ' +
+			s += sp(wht, pad(c.host || '—', CW.host)) + '  ' +
+			     sp(cyn, pad(c.ip || '—', CW.ip)) + '  ' +
 			     sp(grey, pad(c.mac || '?', CW.mac)) + '  ' +
 			     sp(mute, pad(c.port || 'LAN', CW.port)) + '  ' +
 			     sp(cCol, pad(String(n), CW.bnd)) + '  ' +

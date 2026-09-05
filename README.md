@@ -12,7 +12,7 @@ Provides real-time visibility into NPU offload state, PPE flow table health, har
 - **Compass visualisation** — SVG tachometer compass showing NPU path vs. CPU path load, WAN integrity, hardware buffer health, and upstream latency
 - **CPU / NPU Tachometer** — CPU load %, frequency scaling, real-time SoC temperature (°C), governor, and BND activity
 - **Ethernet port gauges** — per-port TX/RX throughput with link speed and BND flow counts for `WAN (LAN 4)` and `LAN 1`–`LAN 3` (internal `eth0` conduit excluded)
-- **Wired client tracking** — discovered LAN clients correlated via bridge FDB, DHCP leases, and neighbor table with active bound flow counters
+- **Wired client tracking** — discovered LAN clients correlated via bridge FDB on physical ports LAN 1–3, with DHCP leases and neighbor table used to resolve IP and hostname while strictly excluding WAN/upstream devices
 - **Frame engine monitoring** — PSE queue depths, GDM/CDM drop counters via direct hardware register reads
 - **Latency & jitter** — background daemon continuously pings an upstream target (default: 1.1.1.1), independent of routing mode
 - **Auto mode detection** — adapts UI between Router and Bridge / AP mode automatically
@@ -36,7 +36,7 @@ Provides real-time visibility into NPU offload state, PPE flow table health, har
 [ Offload Toggles ]          HW Flow Offload / VLAN Offload / PPPoE Offload
 
 [ PPE Terminal ]             Live BND (cyan) + UNB (orange) flow table entries, top 25 each
-                             + Wired LAN client flow breakdown
+                             + Wired LAN client breakdown (Host, IP, MAC, Port LAN 1–3, Bound flows)
 ```
 
 Poll interval: **5 seconds** (all RPC calls made in parallel).
@@ -81,14 +81,14 @@ The RPC backend shell script (`/usr/libexec/rpcd/luci.airoha_flowsense`) require
 
 | Tool | Package | Purpose |
 |------|---------|---------|
-| `ip` | `ip-full` | Neighbor table, interface stats, route detection |
-| `bridge` | `bridge-utils` | Bridge FDB learned MACs and forwarding stats |
-| `tc` | `tc` | Detect CAKE/SQM shaper (conflict alert) |
-| `devmem` | `devmem` | Direct hardware register reads (PSE/GDM/CDM/PLL) |
+| `ip` | `ip-full` / `ip-tiny` | Neighbor table, interface stats, route detection |
+| `brctl` / `bridge` | *(busybox applet)* / `ip-bridge` | Bridge FDB learned MACs and forwarding stats |
+| `tc` | `tc` *(optional)* | Detect CAKE/SQM shaper (conflict alert) |
+| `devmem` | *(busybox applet)* | Direct hardware register reads (PSE/GDM/CDM/PLL) |
 | `ubus` | *(built-in)* | WAN interface status queries |
 | `uci` | *(built-in)* | Read/write offload and firewall config |
 | `jsonfilter` | `jsonfilter` | JSON extraction from ubus output |
-| `strings` | `binutils` | NPU firmware version parsing |
+| `strings` | *(busybox applet)* | NPU firmware version parsing |
 | `ping` | *(built-in)* | Jitter daemon upstream latency measurement |
 | `awk` / `sed` / `grep` | *(busybox)* | Text processing throughout |
 
@@ -115,7 +115,7 @@ Kernel / Hardware
 | Method | Type | Description |
 |--------|------|-------------|
 | `getStatus` | read | NPU version, clock, cores, CPU frequency, temperature, governor |
-| `getPpeEntries` | read | BND/UNB flow entries, per-port counts, wired client flow mapping |
+| `getPpeEntries` | read | BND/UNB flow entries, per-port counts, LAN 1–3 wired client flow mapping |
 | `getFrameEngine` | read | PSE queue depths, GDM/CDM drop counters |
 | `getDeviceMode` | read | Auto-detected Router vs. Bridge / AP mode |
 | `getWanHealth` | read | WAN interface status, physical/logical RX/TX bytes and errors |

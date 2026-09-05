@@ -196,74 +196,97 @@ get_ppe_entries() {
 		unb_json='{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
 	fi
 
-	# Per-port BND counts for LAN ports using bridge FDB learned MACs
-	local macs_p1 macs_p2 macs_p3
-	macs_p1=$(bridge fdb show dev lan1 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
-	macs_p2=$(bridge fdb show dev lan2 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
-	macs_p3=$(bridge fdb show dev lan3 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+	# Per-port BND counts for LAN ports using brctl showmacs or bridge FDB
+	local macs_p1="" macs_p2="" macs_p3=""
+	if command -v brctl >/dev/null 2>&1; then
+		local pno1=1 pno2=2 pno3=3
+		[ -f /sys/class/net/br-lan/brif/lan1/port_no ] && pno1=$(( $(cat /sys/class/net/br-lan/brif/lan1/port_no 2>/dev/null) ))
+		[ -f /sys/class/net/br-lan/brif/lan2/port_no ] && pno2=$(( $(cat /sys/class/net/br-lan/brif/lan2/port_no 2>/dev/null) ))
+		[ -f /sys/class/net/br-lan/brif/lan3/port_no ] && pno3=$(( $(cat /sys/class/net/br-lan/brif/lan3/port_no 2>/dev/null) ))
 
-	local port_bnd="[0,0,0]"
-	if [ -f "$bind_file" ]; then
-		port_bnd=$(awk -v m1="$macs_p1" -v m2="$macs_p2" -v m3="$macs_p3" '
-		function has(macs, eth,    n,arr,i,low) {
-			if (macs == "") return 0
-			low = tolower(eth)
-			n = split(macs, arr, "|")
-			for (i=1; i<=n; i++) if (arr[i] != "" && index(low, tolower(arr[i])) > 0) return 1
-			return 0
-		}
-		/^[0-9a-fA-F]+ BND / {
-			eth=""; match($0,/eth=[^ \t]+/); if (RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
-			if      (has(m1,eth)) c1++
-			else if (has(m2,eth)) c2++
-			else if (has(m3,eth)) c3++
-		}
-		END { printf "[%d,%d,%d]", c1+0, c2+0, c3+0 }
-		' "$bind_file" 2>/dev/null || printf "[0,0,0]")
+		local brmacs
+		brmacs=$(brctl showmacs br-lan 2>/dev/null | awk '$3=="no"{print $1,$2}')
+		macs_p1=$(echo "$brmacs" | awk -v p="$pno1" '$1==p{print tolower($2)}' | tr '\n' '|' | sed 's/|$//')
+		macs_p2=$(echo "$brmacs" | awk -v p="$pno2" '$1==p{print tolower($2)}' | tr '\n' '|' | sed 's/|$//')
+		macs_p3=$(echo "$brmacs" | awk -v p="$pno3" '$1==p{print tolower($2)}' | tr '\n' '|' | sed 's/|$//')
 	fi
-	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"port_bnd":'"$port_bnd"'}/')
+	if [ -z "$macs_p1" ] && [ -z "$macs_p2" ] && [ -z "$macs_p3" ] && command -v bridge >/dev/null 2>&1; then
+		macs_p1=$(bridge fdb show dev lan1 2>/dev/null | grep -v " self\| permanent" | awk '{print tolower($1)}' | tr '\n' '|' | sed 's/|$//')
+		macs_p2=$(bridge fdb show dev lan2 2>/dev/null | grep -v " self\| permanent" | awk '{print tolower($1)}' | tr '\n' '|' | sed 's/|$//')
+		macs_p3=$(bridge fdb show dev lan3 2>/dev/null | grep -v " self\| permanent" | awk '{print tolower($1)}' | tr '\n' '|' | sed 's/|$//')
+	fi
 
-	# Per-client BND counts for wired LAN devices
-	local neigh
-	neigh=$(ip neigh show 2>/dev/null | grep ' lladdr ' | grep -v ' FAILED')
-	local client_bnd="[]"
+	# Router self MACs to ignore
+	local router_macs
+	router_macs=$(cat /sys/class/net/*/address 2>/dev/null | tr 'A-Z' 'a-z' | sort -u | tr '\n' '|' | sed 's/|$//')
+
+	# LAN ARP/neighbor entries (strictly on br-lan)
+	local neigh=""
+	if [ -f /proc/net/arp ]; then
+		neigh=$(grep 'br-lan' /proc/net/arp 2>/dev/null | awk '$4!="00:00:00:00:00:00"{print $1,$4}')
+	fi
+	if [ -z "$neigh" ]; then
+		neigh=$(ip neigh show dev br-lan 2>/dev/null | awk '/lladdr/{print $1,$5}')
+	fi
+
+	local port_bnd="[0,0,0]" client_bnd="[]"
 	if [ -f "$bind_file" ]; then
-		client_bnd=$(
+		local bnd_calc
+		bnd_calc=$(
 		{
-			printf '%s\n' "$macs_p1" | tr '|' '\n' | sed 's/^/@FDB1 /'
-			printf '%s\n' "$macs_p2" | tr '|' '\n' | sed 's/^/@FDB2 /'
-			printf '%s\n' "$macs_p3" | tr '|' '\n' | sed 's/^/@FDB3 /'
-			printf '%s\n' "$neigh" | sed 's/^/@NEIGH /'
+			[ -n "$macs_p1" ] && printf '%s\n' "$macs_p1" | tr '|' '\n' | sed 's/^/@FDB1 /'
+			[ -n "$macs_p2" ] && printf '%s\n' "$macs_p2" | tr '|' '\n' | sed 's/^/@FDB2 /'
+			[ -n "$macs_p3" ] && printf '%s\n' "$macs_p3" | tr '|' '\n' | sed 's/^/@FDB3 /'
+			[ -n "$neigh" ] && printf '%s\n' "$neigh" | sed 's/^/@NEIGH /'
 			sed 's/^/@LEASE /' /tmp/dhcp.leases 2>/dev/null
 			cat "$bind_file"
-		} | awk '
-		BEGIN { ntot=0 }
-		$1=="@FDB1" { mc=tolower($2); if(mc!=""){ mac_port[mc]="LAN 1"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
-		$1=="@FDB2" { mc=tolower($2); if(mc!=""){ mac_port[mc]="LAN 2"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
-		$1=="@FDB3" { mc=tolower($2); if(mc!=""){ mac_port[mc]="LAN 3"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
+		} | awk -v r_macs="$router_macs" '
+		BEGIN {
+			ntot=0
+			n_rm = split(r_macs, arr_rm, "|")
+			for(i=1;i<=n_rm;i++) if(arr_rm[i]!="") self_mac[arr_rm[i]]=1
+		}
+		$1=="@FDB1" { mc=tolower($2); if(mc!="" && !(mc in self_mac)){ mac_port[mc]="LAN 1"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
+		$1=="@FDB2" { mc=tolower($2); if(mc!="" && !(mc in self_mac)){ mac_port[mc]="LAN 2"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
+		$1=="@FDB3" { mc=tolower($2); if(mc!="" && !(mc in self_mac)){ mac_port[mc]="LAN 3"; if(!(mc in seen)){ seen[mc]=1; mac[++ntot]=mc } } next }
 		$1=="@LEASE" {
 			lm=tolower($3); lh=$5; lip=$4; gsub(/["\\]/,"",lh)
-			if(lm!=""){
+			if(lm!="" && !(lm in self_mac)){
 				if(lh!="" && lh!="*") mac2host[lm]=lh
-				if(lip!="" && !(lm in mac2ip)) mac2ip[lm]=lip
+				if(lip!="") mac2ip[lm]=lip
 				if(!(lm in seen)){ seen[lm]=1; mac[++ntot]=lm }
 			}
 			next
 		}
 		$1=="@NEIGH" {
-			ipx=$2; mcx=tolower($6)
-			if(index(ipx,":")==0 && index(ipx,".")>0 && mcx!=""){
-				if(!(mcx in mac2ip)) mac2ip[mcx]=ipx
+			ipx=$2; mcx=tolower($3)
+			if(mcx!="" && !(mcx in self_mac)){
+				if(ipx!="") mac2ip[mcx]=ipx
 				if(!(mcx in seen)){ seen[mcx]=1; mac[++ntot]=mcx }
 			}
 			next
 		}
-		/^[0-9a-fA-F]+ BND / {
+		/^[0-9a-fA-F]+ (BND|BIND) / {
 			eth=""; match($0,/eth=[^ \t]+/); if(RSTART>0) eth=tolower(substr($0,RSTART+4,RLENGTH-4))
-			if(eth=="") next
-			for(i=1;i<=ntot;i++) if(index(eth,mac[i])>0) cnt[i]++
+			orig=""; match($0,/orig=[^ \t]+/); if(RSTART>0) orig=substr($0,RSTART+5,RLENGTH-5)
+			newf=""; match($0,/new=[^ \t]+/); if(RSTART>0) newf=substr($0,RSTART+4,RLENGTH-4)
+			for(i=1;i<=ntot;i++){
+				ip = mac2ip[mac[i]]
+				match_mac = (eth != "" && index(eth, mac[i]) > 0)
+				match_ip = (ip != "" && (index(orig, ip) > 0 || index(newf, ip) > 0))
+				if (match_mac || match_ip) cnt[i]++
+			}
 		}
 		END {
+			pb1=0; pb2=0; pb3=0
+			for(i=1;i<=ntot;i++){
+				p = mac_port[mac[i]]
+				if (p == "LAN 1") pb1 += cnt[i]
+				else if (p == "LAN 2") pb2 += cnt[i]
+				else if (p == "LAN 3") pb3 += cnt[i]
+			}
+			printf "[%d,%d,%d]\n", pb1, pb2, pb3
+
 			printf "["
 			for(i=1;i<=ntot;i++){
 				ip = (mac[i] in mac2ip) ? mac2ip[mac[i]] : ""
@@ -272,11 +295,17 @@ get_ppe_entries() {
 				if(i>1) printf ","
 				printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"host\":\"%s\",\"port\":\"%s\",\"bnd\":%d}", mac[i], ip, host, port, cnt[i]+0
 			}
-			printf "]"
+			printf "]\n"
 		}
-		' 2>/dev/null || printf "[]")
+		' 2>/dev/null)
+		if [ -n "$bnd_calc" ]; then
+			port_bnd=$(echo "$bnd_calc" | sed -n '1p')
+			client_bnd=$(echo "$bnd_calc" | sed -n '2p')
+			[ -z "$port_bnd" ] && port_bnd="[0,0,0]"
+			[ -z "$client_bnd" ] && client_bnd="[]"
+		fi
 	fi
-	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"client_bnd":'"$client_bnd"'}/')
+	bnd_json="${bnd_json%\}},\"port_bnd\":${port_bnd},\"client_bnd\":${client_bnd}}"
 
 	printf '{"bnd":%s,"unb":%s}' "$bnd_json" "$unb_json"
 }

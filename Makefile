@@ -7,7 +7,7 @@ PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0
 
 LUCI_TITLE:=LuCI Airoha FlowSense — Offload & PPE Monitor
-LUCI_DEPENDS:=+luci-base @TARGET_airoha
+LUCI_DEPENDS:=+luci-base @TARGET_airoha +jsonfilter
 
 include $(TOPDIR)/feeds/luci/luci.mk
 
