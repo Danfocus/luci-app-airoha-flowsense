@@ -543,13 +543,17 @@ get_wan_health() {
 		fi
 	fi
 
-	# For PPPoE / virtual WAN, errors may only be visible on the physical interface
+	# For PPPoE / virtual WAN, errors and drops may only be visible on the physical interface
 	if [ -n "$phy_device" ] && [ "$phy_device" != "$l3_device" ]; then
-		local phy_rx_err phy_tx_err
+		local phy_rx_err phy_tx_err phy_rx_drp phy_tx_drp
 		phy_rx_err=$(cat "/sys/class/net/${phy_device}/statistics/rx_errors" 2>/dev/null || echo 0)
 		phy_tx_err=$(cat "/sys/class/net/${phy_device}/statistics/tx_errors" 2>/dev/null || echo 0)
+		phy_rx_drp=$(cat "/sys/class/net/${phy_device}/statistics/rx_dropped" 2>/dev/null || echo 0)
+		phy_tx_drp=$(cat "/sys/class/net/${phy_device}/statistics/tx_dropped" 2>/dev/null || echo 0)
 		[ "${phy_rx_err:-0}" -gt "${rx_errors:-0}" ] && rx_errors=$phy_rx_err
 		[ "${phy_tx_err:-0}" -gt "${tx_errors:-0}" ] && tx_errors=$phy_tx_err
+		[ "${phy_rx_drp:-0}" -gt "${rx_dropped:-0}" ] && rx_dropped=$phy_rx_drp
+		[ "${phy_tx_drp:-0}" -gt "${tx_dropped:-0}" ] && tx_dropped=$phy_tx_drp
 	fi
 
 	printf '{"available":true,"up":%s,"device":"%s","uptime":%d,"rx_bytes":%d,"tx_bytes":%d,"rx_errors":%d,"tx_errors":%d,"rx_dropped":%d,"tx_dropped":%d}' \

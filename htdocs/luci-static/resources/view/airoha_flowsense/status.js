@@ -6,7 +6,7 @@
 
 /* ── Drop-delta tracking (all counters are cumulative since interface up) ── */
 var _prevPseDrops    = null;
-var _prevCdmHwfDrops = null;
+var _prevCdmDrops    = null;
 var _prevBridgeDrops = null;
 var _prevPpeBnd      = null;  // for tachometer heartbeat
 var _prevEthBytes    = {};    // iface -> {tx, rx, time}
@@ -523,19 +523,20 @@ function hwBufferState(fe, ppe, mode) {
 	var pseDrops = 0;
 	ports.forEach(function(p) { pseDrops += (p.drops || 0); });
 
-	// CDM HW-forwarding drops — frames the NPU forwarded that CDM couldn't accept.
-	// More sensitive than GDM TX drops (which only fire at wire-level jam) and
-	// directly reflects NPU path congestion.
+	// CDM drops — frames dropped on Host CPU DMA ring (QDMA1/2 rx_cpu_drop) or HW forwarding (rx_hwf_drop).
+	// Directly reflects NPU/CPU path and DMA ring congestion.
+	var cdmCpuDrops = ((fe.cdm1||{}).rx_cpu_drop||0) + ((fe.cdm2||{}).rx_cpu_drop||0);
 	var cdmHwfDrops = ((fe.cdm1||{}).rx_hwf_drop||0) + ((fe.cdm2||{}).rx_hwf_drop||0);
+	var cdmDrops    = cdmCpuDrops + cdmHwfDrops;
 
 	// Delta since last poll — null on first call (baseline only, no alarm)
-	var pseDelta    = (_prevPseDrops    !== null && pseDrops    >= _prevPseDrops)    ? (pseDrops    - _prevPseDrops)    : 0;
-	var cdmHwfDelta = (_prevCdmHwfDrops !== null && cdmHwfDrops >= _prevCdmHwfDrops) ? (cdmHwfDrops - _prevCdmHwfDrops) : 0;
-	_prevPseDrops    = pseDrops;
-	_prevCdmHwfDrops = cdmHwfDrops;
+	var pseDelta = (_prevPseDrops !== null && pseDrops >= _prevPseDrops) ? (pseDrops - _prevPseDrops) : 0;
+	var cdmDelta = (_prevCdmDrops !== null && cdmDrops >= _prevCdmDrops) ? (cdmDrops - _prevCdmDrops) : 0;
+	_prevPseDrops = pseDrops;
+	_prevCdmDrops = cdmDrops;
 
-	// DROPPING on CDM HW-forwarding drops or very high PSE bursts (>200/poll).
-	var activeDrop = cdmHwfDelta > 0 || pseDelta > 200;
+	// DROPPING on active CDM drops or very high PSE bursts (>200/poll).
+	var activeDrop = cdmDelta > 0 || pseDelta > 200;
 
 	// PPE offload efficiency — BND/(BND+UNB). Shown in subtitle for info only.
 	// LOW OFFLOAD state removed: low BND% when idle is expected, not a problem.
@@ -545,9 +546,16 @@ function hwBufferState(fe, ppe, mode) {
 	var ppePct   = ppeTotal > 0 ? Math.round(ppeBound / ppeTotal * 100) : 0;
 
 	var color = activeDrop ? '#f5a623' : '#00cc44';
+	var southVal = activeDrop ? 'DROPPING' : 'HEALTHY';
+	var cdmSub = cdmDrops > 0 ? ('CDM: ' + cdmDrops + (cdmDelta > 0 ? ' (Δ' + cdmDelta + ')' : '')) : ('CDM Δ: ' + cdmDelta);
+	var southSub = cdmSub + ' | PSE Δ: ' + pseDelta + ' | PPE: ' + ppePct + '% BND';
+
 	return {
-		pseDrops: pseDrops, cdmHwfDrops: cdmHwfDrops, pseDelta: pseDelta, cdmHwfDelta: cdmHwfDelta,
+		pseDrops: pseDrops, pseDelta: pseDelta,
+		cdmDrops: cdmDrops, cdmDelta: cdmDelta,
+		cdmCpuDrops: cdmCpuDrops, cdmHwfDrops: cdmHwfDrops,
 		activeDrop: activeDrop,
+		southVal: southVal, southSub: southSub,
 		ppeBound: ppeBound, ppeTotal: ppeTotal, ppePct: ppePct,
 		color: color, pulsing: activeDrop
 	};
@@ -566,15 +574,33 @@ function compassState(bypass, hwBuf, jitter, wan, bridge, mode) {
 	// Latency — jitter daemon pings upstream and works in both router and AP mode
 	var latMs = jitter.last_ping || 0;
 
-	// Integrity / errors
-	var errCount = (wan.rx_errors||0) + (wan.tx_errors||0);
-	var eastAlarm = errCount > 0;
-	var eastColor = eastAlarm ? '#d0021b' : '#00cc44';
+	// WAN Integrity / errors & drops
+	var rxErr = wan.rx_errors || 0;
+	var txErr = wan.tx_errors || 0;
+	var rxDrp = wan.rx_dropped || 0;
+	var txDrp = wan.tx_dropped || 0;
+	var errCount = rxErr + txErr;
+	var dropCount = rxDrp + txDrp;
+	var eastAlarm = (errCount > 0) || (dropCount > 0);
+	var eastColor = errCount > 0 ? '#d0021b' : (dropCount > 0 ? '#f5a623' : '#00cc44');
+
+	var eastVal = 'CLEAN';
+	if (errCount > 0 && dropCount > 0) {
+		eastVal = errCount + ' ERR / ' + dropCount + ' DRP';
+	} else if (errCount > 0) {
+		eastVal = errCount + ' ERROR' + (errCount > 1 ? 'S' : '');
+	} else if (dropCount > 0) {
+		eastVal = dropCount + ' DROP' + (dropCount > 1 ? 'S' : '');
+	}
+	var eastSub = 'Errors: ' + errCount + '  |  Drops: ' + dropCount;
 
 	return {
 		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, wanMbps:wanMbps,
 		hwBuf:hwBuf, mode:mode,
-		latMs:latMs, errCount:errCount, eastAlarm:eastAlarm,
+		latMs:latMs,
+		errCount:errCount, dropCount:dropCount,
+		eastVal:eastVal, eastSub:eastSub,
+		eastAlarm:eastAlarm,
 		latColor:latencyColor(latMs),
 		eastColor: eastColor
 	};
@@ -587,7 +613,7 @@ function buildCompassSVG(cs, mode, ppe) {
 	var npuGlow     = cs.npuActive  ? ' filter="url(#f-cyan)"'   : '';
 	var cpuGlow     = !cs.hwEnabled ? ' filter="url(#f-orange)"' : '';
 	var eastOpacity = cs.eastAlarm ? '1' : '0.45';
-	var eastGlow    = cs.eastAlarm ? ' filter="url(#f-red)"'  : '';
+	var eastGlow    = cs.eastAlarm ? (cs.errCount > 0 ? ' filter="url(#f-red)"' : ' filter="url(#f-orange)"') : '';
 	var southOpacity= cs.hwBuf.pulsing ? '1' : '0.45';
 	var southAnim   = cs.hwBuf.pulsing ? ' style="animation:sqm-pulse 1.5s ease-in-out infinite"' : '';
 	var tip = needleTip(cs.latMs);
@@ -680,7 +706,10 @@ function updateCompassSVG(cs, mode, ppe) {
 	var arcCpu = document.getElementById('cp-arc-cpu');
 	if (arcCpu) { if(!cs.hwEnabled) arcCpu.setAttribute('filter','url(#f-orange)'); else arcCpu.removeAttribute('filter'); }
 	var arcEast = document.getElementById('cp-arc-east');
-	if (arcEast) { if(cs.eastAlarm) arcEast.setAttribute('filter','url(#f-red)'); else arcEast.removeAttribute('filter'); }
+	if (arcEast) {
+		if (cs.eastAlarm) arcEast.setAttribute('filter', cs.errCount > 0 ? 'url(#f-red)' : 'url(#f-orange)');
+		else arcEast.removeAttribute('filter');
+	}
 
 	sa('cp-needle',       'x2',    tip[0].toFixed(1));
 	sa('cp-needle',       'y2',    tip[1].toFixed(1));
@@ -928,16 +957,16 @@ function renderCompassCards(cs, bypass, jitter, wan, bridge, mode) {
 		? 'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta
 		: 'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps';
 
-	// East card: Integrity
-	var eastVal = cs.eastAlarm ? cs.errCount+' ERROR'+(cs.errCount>1?'S':'') : 'CLEAN';
-	var eastSub = 'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0);
-	var eastColor = cs.eastColor;
+	// East card: WAN Integrity
+	var eastVal   = cs.eastVal || 'CLEAN';
+	var eastSub   = cs.eastSub || 'Errors: 0  |  Drops: 0';
+	var eastColor = cs.eastColor || '#00cc44';
 
 	// South card: HW Buffer Health
 	var hb = cs.hwBuf || {};
-	var southVal   = hb.activeDrop ? 'DROPPING' : 'HEALTHY';
+	var southVal   = hb.southVal || 'HEALTHY';
 	var southColor = hb.color || '#00cc44';
-	var southSub   = 'PSE Δ: '+hb.pseDelta+' CDM Δ: '+hb.cdmHwfDelta+' | PPE: '+hb.ppePct+'% BND ('+hb.ppeBound+'/'+hb.ppeTotal+')';
+	var southSub   = hb.southSub || '';
 
 	// West card: Latency
 	var latVal   = cs.latMs > 0 ? cs.latMs.toFixed(1)+'ms' : (jitter.available===false ? 'N/A' : '---');
@@ -953,10 +982,10 @@ function renderCompassCards(cs, bypass, jitter, wan, bridge, mode) {
 	}
 
 	return E('div', { 'class': 'compass-cards', 'id': 'compass-cards' }, [
-		card('NPU Path',    northVal, northColor, northSub),
-		card('Integrity',   eastVal,  eastColor,  eastSub),
-		card('Latency',     latVal,   latColor,   latSub),
-		card('HW Buffer',   southVal, southColor, southSub)
+		card('NPU Path',      northVal, northColor, northSub),
+		card('WAN Integrity', eastVal,  eastColor,  eastSub),
+		card('Latency',       latVal,   latColor,   latSub),
+		card('HW Buffer',     southVal, southColor, southSub)
 	]);
 }
 
@@ -985,19 +1014,14 @@ function updateCompassCards(cs, bypass, jitter, wan, bridge, mode) {
 			?'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta2
 			:'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps');
 
-	setCard(divs[1], cs.eastAlarm?cs.errCount+' ERROR'+(cs.errCount>1?'S':''):'CLEAN',
-		cs.eastColor,
-		'RX errors: '+(wan.rx_errors||0)+'  TX errors: '+(wan.tx_errors||0));
+	setCard(divs[1], cs.eastVal||'CLEAN', cs.eastColor||'#00cc44', cs.eastSub||'Errors: 0  |  Drops: 0');
 
 	var latVal = cs.latMs > 0 ? cs.latMs.toFixed(1)+'ms' : (jitter.available===false?'N/A':'---');
 	setCard(divs[2], latVal, cs.latColor,
 		'Jitter: '+(jitter.jitter||0).toFixed(1)+'ms  |  '+(jitter.samples||0)+' samples  |  '+(jitter.target||'1.1.1.1'));
 
 	var hb = cs.hwBuf || {};
-	setCard(divs[3],
-		hb.activeDrop?'DROPPING':'HEALTHY',
-		hb.color||'#00cc44',
-		'PSE Δ: '+hb.pseDelta+' CDM Δ: '+hb.cdmHwfDelta+' | PPE: '+hb.ppePct+'% BND ('+hb.ppeBound+'/'+hb.ppeTotal+')');
+	setCard(divs[3], hb.southVal||'HEALTHY', hb.color||'#00cc44', hb.southSub||'');
 }
 
 /* ── Main View ── */
