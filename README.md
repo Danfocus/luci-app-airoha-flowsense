@@ -13,7 +13,7 @@ Provides real-time visibility into NPU offload state, PPE flow table health, har
 - **CPU / NPU Tachometer** — CPU load %, frequency scaling, real-time SoC temperature (°C), governor, and BND activity
 - **Ethernet port gauges** — per-port TX/RX throughput with link speed and BND flow counts for `WAN (LAN 4)` and `LAN 1`–`LAN 3` (internal `eth0` conduit excluded)
 - **Wired client tracking** — discovered LAN clients correlated via bridge FDB on physical ports LAN 1–3, with DHCP leases and neighbor table used to resolve IP and hostname while strictly excluding WAN/upstream devices
-- **Frame engine monitoring** — PSE queue depths, GDM/CDM drop counters via direct hardware register reads
+- **Frame engine monitoring** — PSE queue depths, GDM/CDM drop counters via direct hardware register reads (tracking both host CPU QDMA1/2 DMA ring drops and HW forwarding drops)
 - **Latency & jitter** — background daemon continuously pings an upstream target (default: 1.1.1.1), independent of routing mode
 - **Auto mode detection** — adapts UI between Router and Bridge / AP mode automatically
 - **Conflict alerts** — warns when NPU offload is bypassing SQM/CAKE, physical hardware errors are present on WAN, or latency is unexpectedly high despite offload being active
@@ -27,9 +27,13 @@ Provides real-time visibility into NPU offload state, PPE flow table health, har
 [ Conflict Alerts ]          (collapsible — ghost shaper / physical errors / latency anomaly)
 
 [ CPU/NPU Tachometer ]       CPU load % + frequency + temperature + governor + BND count
-[ Main Compass ]             NPU path / integrity / buffer health / latency
+[ Main Compass ]             NPU path / WAN integrity / buffer health / latency
 
-[ Compass Cards x4 ]         NPU Path / WAN Integrity / Upstream Latency / HW Buffer Health
+[ Compass Cards x4 ]
+  · North: NPU Path          NPU active/idle vs. CPU path, WAN throughput, CPU load %
+  · East:  WAN Integrity     WAN link physical CRC/framing errors and interface packet drops
+  · West:  Latency           Upstream ping latency and jitter
+  · South: HW Buffer Health  Frame Engine buffer & CDM QDMA1/2 CPU ring drops, PPE bound %
 [ Ethernet Port Gauges ]     WAN (LAN 4) + LAN 1–3: TX/RX bars, link speed, BND counts
 [ Mode Banner ]              Auto-detected ROUTER MODE vs. BRIDGE / AP
 
@@ -118,7 +122,7 @@ Kernel / Hardware
 | `getPpeEntries` | read | BND/UNB flow entries, per-port counts, LAN 1–3 wired client flow mapping |
 | `getFrameEngine` | read | PSE queue depths, GDM/CDM drop counters |
 | `getDeviceMode` | read | Auto-detected Router vs. Bridge / AP mode |
-| `getWanHealth` | read | WAN interface status, physical/logical RX/TX bytes and errors |
+| `getWanHealth` | read | WAN interface status, physical/logical RX/TX bytes, interface drops, and PHY errors |
 | `getJitterResult` | read | Upstream latency, jitter, reachability from daemon |
 | `getBridgeStats` | read | Bridge RX/TX bytes, drops, forwarding errors |
 | `getNpuBypass` | read | HW offload active, CPU%, WAN Mbps, forwarding path |

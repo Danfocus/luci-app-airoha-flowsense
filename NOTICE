@@ -17,4 +17,6 @@ Copyright 2026 Danfocus
 - Added caching for NPU reserved memory regions to eliminate repetitive dmesg calls
 - Fixed double-echo arithmetic parsing bug in get_status for npu_cores, offload_bound, and offload_total
 - Improved physical WAN interface error and traffic detection for virtual/PPPoE connections
+- Fixed QDMA1/QDMA2 host CPU drops tracking in HW Buffer: included rx_cpu_drop (registers 0x1fb505a0/0x1fb515a0) alongside rx_hwf_drop, displaying cumulative drop counters so host CPU drops are not silently masked when deltas are zero
+- Enhanced WAN Integrity monitoring: renamed card to WAN Integrity to clearly reflect scope and included interface packet drops (rx_dropped/tx_dropped) alongside PHY CRC/framing errors on physical and virtual interfaces
 - Updated RPCD ACL definitions to grant access to thermal sensor and safe devmem reads
